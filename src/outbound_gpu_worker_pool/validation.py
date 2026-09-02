@@ -67,13 +67,16 @@ def validate_job_submission(submission: JobSubmission) -> None:
     ):
         if value is not None and (not value or len(value) > maximum):
             raise ValueError(f"{label} must contain 1 to {maximum} characters")
-    if not 1 <= len(submission.input_keys) <= MAX_JOB_INPUT_KEYS:
-        raise ValueError(f"input_keys must hold 1 to {MAX_JOB_INPUT_KEYS} entries")
+    # A capability may take no inputs at all: text-to-video is prompt-only.
+    if len(submission.input_keys) > MAX_JOB_INPUT_KEYS:
+        raise ValueError(f"input_keys must hold at most {MAX_JOB_INPUT_KEYS} entries")
     for key in submission.input_keys:
-        if not key or len(key) > MAX_ASSET_KEY_LENGTH:
+        if not isinstance(key, str) or not key or len(key) > MAX_ASSET_KEY_LENGTH:
             raise ValueError(
                 f"input_keys entries must contain 1 to {MAX_ASSET_KEY_LENGTH} characters"
             )
+    if len(set(submission.input_keys)) != len(submission.input_keys):
+        raise ValueError("input_keys must not repeat a key")
     if submission.contract_version < 1:
         raise ValueError("contract_version must be positive")
     validate_capability_id(submission.capability_id)
