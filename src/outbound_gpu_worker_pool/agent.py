@@ -49,6 +49,9 @@ CREATE_ONCE_CONFLICT_STATUS = 412
 DIGEST_CHUNK_BYTES = 1024 * 1024
 DRAIN_RELEASE_REASON = "draining"
 INPUTS_DIRECTORY = "inputs"
+# The scratch bound: a machine's disk is the operator's, so one granted input
+# may never fill it. Downloading stops at the first chunk that would pass this.
+DEFAULT_MAX_INPUT_BYTES = 2 * 1024 * 1024 * 1024
 
 
 class TransferError(RuntimeError):
@@ -64,8 +67,14 @@ class AgentOutcome(StrEnum):
 
 
 class AssetTransfer(Protocol):
-    async def download(self, url: str, destination: Path) -> int:
-        """Write the granted object to destination and return the bytes written."""
+    async def download(
+        self, url: str, destination: Path, max_bytes: int | None = None
+    ) -> int:
+        """Write the granted object to destination and return the bytes written.
+
+        `max_bytes` is the caller's scratch bound; a transport that can stop
+        mid-stream raises `TransferError` rather than writing past it.
+        """
         ...
 
     async def upload(self, url: str, source: Path, content_type: str) -> None:
@@ -79,7 +88,9 @@ class HttpAssetTransfer:
     def __init__(self, client: httpx.AsyncClient) -> None:
         self._client = client
 
-    async def download(self, url: str, destination: Path) -> int:
+    async def download(
+        self, url: str, destination: Path, max_bytes: int | None = None
+    ) -> int:
         written = 0
         async with self._client.stream("GET", url) as response:
             if response.status_code // 100 != 2:
@@ -88,6 +99,10 @@ class HttpAssetTransfer:
                 )
             with destination.open("wb") as handle:
                 async for chunk in response.aiter_bytes():
+                    if max_bytes is not None and written + len(chunk) > max_bytes:
+                        raise TransferError(
+                            f"asset download passed the {max_bytes} byte input bound"
+                        )
                     handle.write(chunk)
                     written += len(chunk)
         return written
@@ -129,6 +144,7 @@ class WorkerAgent:
         http: httpx.AsyncClient,
         workspace_root: Path,
         concurrency: int = 1,
+        max_input_bytes: int = DEFAULT_MAX_INPUT_BYTES,
         min_poll_seconds: float = 2.0,
         max_poll_seconds: float = 60.0,
         lease_seconds: int = 1200,
@@ -147,6 +163,7 @@ class WorkerAgent:
         self._transfer = transfer
         self._http = http
         self._workspace_root = workspace_root
+        self.max_input_bytes = max_input_bytes
         self._min_poll_seconds = min_poll_seconds
         self._max_poll_seconds = max_poll_seconds
         self._lease_seconds = lease_seconds
@@ -290,7 +307,15 @@ class WorkerAgent:
         paths: dict[str, Path] = {}
         for grant in lease.input_grants:
             destination = inputs / PurePosixPath(grant.key).name
-            written = await self._transfer.download(grant.url, destination)
+            written = await self._transfer.download(
+                grant.url, destination, self.max_input_bytes
+            )
+            # The bound is the agent's, not the transport's: a transfer that
+            # cannot stop mid-stream still cannot hand back an oversized input.
+            if written > self.max_input_bytes:
+                raise TransferError(
+                    f"an input passed the {self.max_input_bytes} byte bound"
+                )
             paths[grant.key] = destination
             logger.debug(
                 "worker downloaded input",

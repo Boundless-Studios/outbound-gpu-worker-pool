@@ -7,7 +7,7 @@ import signal
 import pytest
 
 from outbound_gpu_worker_pool import agent_main
-from outbound_gpu_worker_pool.agent import WorkerAgent
+from outbound_gpu_worker_pool.agent import DEFAULT_MAX_INPUT_BYTES, WorkerAgent
 
 STATIC_ENVIRONMENT = {
     "OGWP_WORKER_COORDINATOR_URL": "https://coordinator.invalid",
@@ -27,6 +27,15 @@ def test_a_static_configuration_builds_a_bearer_credentialled_agent() -> None:
     assert agent.worker_id == "worker-a"
     assert agent.credential() == "token-a"
     assert agent.capability_ids == ("test.deterministic.echo.v1",)
+    assert agent.max_input_bytes == DEFAULT_MAX_INPUT_BYTES
+
+
+def test_a_the_scratch_bound_is_configurable() -> None:
+    agent = agent_main.build_agent_from_env(
+        STATIC_ENVIRONMENT | {"OGWP_WORKER_MAX_INPUT_BYTES": "1048576"}
+    )
+
+    assert agent.max_input_bytes == 1024 * 1024
 
 
 def test_a_the_comfy_plugin_is_built_from_the_packaged_templates() -> None:

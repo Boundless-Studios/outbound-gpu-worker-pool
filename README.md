@@ -234,12 +234,17 @@ python -m outbound_gpu_worker_pool.agent_main
 | `OGWP_WORKER_PLUGINS` | comma separated, default `deterministic-echo` | the plugins this machine is approved to run (`comfy-workflow` below) |
 | `OGWP_WORKER_CONCURRENCY` | default `1` | leases this machine advertises per capability |
 | `OGWP_WORKER_WORKSPACE` | path, default `<tmpdir>/outbound-gpu-worker` | per-job workspaces are created and deleted under here |
+| `OGWP_WORKER_MAX_INPUT_BYTES` | default `2147483648` (2 GiB) | the scratch bound: a single granted input larger than this aborts the download and releases the job |
 | `OGWP_WORKER_GPU_MODEL` | free text | advertised to the registry |
 | `OGWP_WORKER_VRAM_MB` | integer | advertised to the registry |
 
 SIGTERM and SIGINT drain: the in-flight job finishes, a final draining heartbeat is sent, and
 the process exits 0. A lease taken as draining begins is released back to the pool rather than
 started.
+
+To put the agent on a real Linux machine — one script, a systemd *user* unit, and a check that
+proves the box exposes nothing new — see [`docs/operations.md`](docs/operations.md) and
+`deploy/agent/`.
 
 Writing your own plugin means implementing `GpuExecutorPlugin` — `capabilities()`,
 `validate(lease)`, `execute(context, request)`, `cancel(job_id)`, `health()` — and naming it in
@@ -327,6 +332,8 @@ replay rather than an overwrite: the upload's `412` is treated as already-publis
 
 [`docs/design.md`](docs/design.md) has the architecture, the trust boundaries, the
 alternatives that were rejected, and the rollout plan.
+[`docs/operations.md`](docs/operations.md) is the other half: installing, enrolling, running,
+verifying, draining, upgrading, and rotating a worker machine.
 
 Status: alpha, slice 1 of the design's rollout — durable capability leases, the authenticated
 coordinator API, job-scoped asset grants with verified immutable outputs, and the deterministic
