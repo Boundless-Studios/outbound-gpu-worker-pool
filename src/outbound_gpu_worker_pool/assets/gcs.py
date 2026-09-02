@@ -97,6 +97,13 @@ class GcsAssetStore:
         except Exception as exc:
             raise RuntimeError(f"asset bucket is unavailable: {self._bucket}") from exc
 
+    async def stop(self) -> None:
+        """Drop the client and signing credentials this store created for itself."""
+        if self._ambient_credentials is not None:
+            self._client = None
+            self._ambient_credentials = None
+            self._signing_access_token = None
+
     async def create_read_url(self, key: str) -> str:
         object_key = _validate_object_key(key)
         _require_prefix(object_key, self._allowed_read_prefixes, "read")
