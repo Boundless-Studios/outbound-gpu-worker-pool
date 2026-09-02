@@ -28,6 +28,7 @@ inbound call to a worker, ever.
 ```bash
 pip install outbound-gpu-worker-pool[coordinator]   # asyncpg + fastapi, the server side
 pip install outbound-gpu-worker-pool[agent]         # httpx, the worker side
+pip install outbound-gpu-worker-pool[comfy]         # the approved-workflow ComfyUI plugin
 pip install outbound-gpu-worker-pool[gcs]           # Google Cloud Storage asset store
 pip install outbound-gpu-worker-pool[google-auth]   # verify or mint Google identity tokens
 ```
@@ -230,7 +231,7 @@ python -m outbound_gpu_worker_pool.agent_main
 | `OGWP_WORKER_AUTH` | `static` (default), `google_oidc` | credential source |
 | `OGWP_WORKER_TOKEN` | the token itself | required for `static` |
 | `OGWP_WORKER_AUDIENCE` | audience string | required for `google_oidc`; a fresh identity token is minted per request |
-| `OGWP_WORKER_PLUGINS` | comma separated, default `deterministic-echo` | the plugins this machine is approved to run |
+| `OGWP_WORKER_PLUGINS` | comma separated, default `deterministic-echo` | the plugins this machine is approved to run (`comfy-workflow` below) |
 | `OGWP_WORKER_CONCURRENCY` | default `1` | leases this machine advertises per capability |
 | `OGWP_WORKER_WORKSPACE` | path, default `<tmpdir>/outbound-gpu-worker` | per-job workspaces are created and deleted under here |
 | `OGWP_WORKER_GPU_MODEL` | free text | advertised to the registry |
@@ -244,6 +245,68 @@ Writing your own plugin means implementing `GpuExecutorPlugin` — `capabilities
 `validate(lease)`, `execute(context, request)`, `cancel(job_id)`, `health()` — and naming it in
 `OGWP_WORKER_PLUGINS`. `validate` is the terminal gate: it runs before a single byte is
 downloaded. `DeterministicEchoPlugin` is the reference implementation and the round-trip probe.
+
+## ComfyUI approved workflows
+
+`comfy-workflow` runs ComfyUI on a machine you already trust, without letting a job decide
+what runs there. **A job never carries a graph.** A capability id maps to a *workflow
+template* — a versioned ComfyUI API-format graph the operator installed on the machine —
+and the job may only fill the template's declared allowlist:
+
+- a **typed input** per allowlist entry: a name, the node and node input it fills, its kind
+  (`string`, `integer`, `number`, `boolean`), and its bounds and default. Anything outside the
+  allowlist, of the wrong type, or out of range is a terminal rejection before a byte moves.
+- an **image slot** per declared `LoadImage` node. The job binds a slot to an asset key the
+  lease already granted (`{"images": {"first_frame": "inputs/…/frame.png"}}`); a slot bound to
+  a key the coordinator did not grant, and a granted input no slot binds, are both rejected.
+  An unbound optional slot is removed from the submitted graph along with the link into it.
+
+A template is a `*.template.json` file — `capability_id`, `contract_version`,
+`template_version`, `model_id`, `model_version`, `output_node_id`, `output_content_type`,
+`inputs`, `image_slots`, `graph` — and an operator installs a set of them by pointing
+`OGWP_COMFY_TEMPLATES_DIR` at a directory of them. Every file is validated on load: the
+capability id, that each referenced node exists in the graph, that a slot's node really is a
+`LoadImage`, that every input kind is known, and that no two templates claim one capability.
+A bad file names itself and the worker refuses to start.
+
+One template ships in the package and is the default: `video.minimax_h3.text_to_video.v1`,
+model `minimax-h3` / `fl2va-int8`, contract `1`, output `video/mp4`.
+
+| Input | Kind | Range | Default |
+|---|---|---|---|
+| `prompt` | string | 1–2000 characters | required |
+| `width` | integer | 256–1344 | 1344 |
+| `height` | integer | 256–1344 | 768 |
+| `length` | integer | 17–161 | 56 |
+| `steps` | integer | 4–40 | 20 |
+| `seed` | integer | ≥ 0 | 0 |
+| `fps` | integer | 8–30 | 24 |
+| `images.first_frame` | asset key | a granted input key | optional |
+
+**The runtime is local by construction.** `OGWP_COMFY_URL` must address loopback (`127.0.0.1`,
+`localhost`, `::1`) or a private address (RFC1918, or `100.64.0.0/10` for a tailnet); the
+plugin refuses to start against anything else, so an approved template cannot be pointed at a
+runtime the operator does not own. Uploaded frames are named per job, the output prefix is
+`ogwp/<job_id>`, and nothing the plugin logs or raises carries the prompt text or the runtime
+address.
+
+Run it with `pip install outbound-gpu-worker-pool[comfy]` and:
+
+```bash
+OGWP_WORKER_PLUGINS=comfy-workflow \
+OGWP_COMFY_URL=http://127.0.0.1:8188 \
+OGWP_COMFY_TEMPLATES_DIR=/etc/outbound-gpu-worker/templates \
+python -m outbound_gpu_worker_pool.agent_main
+```
+
+| Variable | Values | Meaning |
+|---|---|---|
+| `OGWP_COMFY_URL` | default `http://127.0.0.1:8188` | the local ComfyUI; loopback or private only |
+| `OGWP_COMFY_TEMPLATES_DIR` | path, default the packaged templates | the workflow templates this machine is approved to run |
+
+A coordinator publishes the same templates' schemas with
+`OGWP_CAPABILITY_PLUGINS=comfy-workflow`. It reads the packaged template directory for the
+schemas only and never opens a connection to any runtime.
 
 ## Failure semantics
 

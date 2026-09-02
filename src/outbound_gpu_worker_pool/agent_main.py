@@ -29,8 +29,36 @@ GOOGLE_OIDC_AUTH = "google_oidc"
 DEFAULT_WORKSPACE_NAME = "outbound-gpu-worker"
 COORDINATOR_TIMEOUT_SECONDS = 60.0
 TRANSFER_TIMEOUT_SECONDS = 900.0
-KNOWN_PLUGINS: dict[str, Callable[[], GpuExecutorPlugin]] = {
-    DETERMINISTIC_ECHO_PLUGIN_ID: DeterministicEchoPlugin,
+COMFY_TIMEOUT_SECONDS = 900.0
+COMFY_WORKFLOW_PLUGIN_ID = "comfy-workflow"
+
+
+def _comfy_workflow_plugin(environment: Mapping[str, str]) -> GpuExecutorPlugin:
+    """The approved-workflow plugin over the machine's own ComfyUI.
+
+    Imported here rather than at module scope so a machine that runs only the
+    reference plugin never needs the `comfy` extra installed.
+    """
+    from outbound_gpu_worker_pool.comfy import (
+        DEFAULT_COMFY_BASE_URL,
+        PACKAGED_TEMPLATES_DIRECTORY,
+        ComfyWorkflowPlugin,
+        TemplateRegistry,
+    )
+
+    directory = environment.get("OGWP_COMFY_TEMPLATES_DIR")
+    return ComfyWorkflowPlugin(
+        TemplateRegistry.from_directory(
+            Path(directory) if directory else PACKAGED_TEMPLATES_DIRECTORY
+        ),
+        client=httpx.AsyncClient(timeout=COMFY_TIMEOUT_SECONDS),
+        base_url=environment.get("OGWP_COMFY_URL", DEFAULT_COMFY_BASE_URL),
+    )
+
+
+KNOWN_PLUGINS: dict[str, Callable[[Mapping[str, str]], GpuExecutorPlugin]] = {
+    DETERMINISTIC_ECHO_PLUGIN_ID: lambda environment: DeterministicEchoPlugin(),
+    COMFY_WORKFLOW_PLUGIN_ID: _comfy_workflow_plugin,
 }
 
 
@@ -48,7 +76,7 @@ def build_agent_from_env(environment: Mapping[str, str]) -> WorkerAgent:
     else:
         raise ValueError(f"unsupported OGWP_WORKER_AUTH: {auth}")
     plugins = tuple(
-        _plugin(name)
+        _plugin(name, environment)
         for name in environment.get(
             "OGWP_WORKER_PLUGINS", DETERMINISTIC_ECHO_PLUGIN_ID
         ).split(",")
@@ -97,11 +125,11 @@ def _required(environment: Mapping[str, str], name: str) -> str:
     return value
 
 
-def _plugin(name: str) -> GpuExecutorPlugin:
+def _plugin(name: str, environment: Mapping[str, str]) -> GpuExecutorPlugin:
     factory = KNOWN_PLUGINS.get(name.strip())
     if factory is None:
         raise ValueError(f"unknown worker plugin: {name}")
-    return factory()
+    return factory(environment)
 
 
 def _google_id_token(audience: str) -> str:

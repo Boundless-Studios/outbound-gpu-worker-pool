@@ -9,7 +9,7 @@ so an unauthenticated coordinator would be a coordinator with no purpose.
 """
 
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 from fastapi import FastAPI
 
@@ -54,12 +54,35 @@ MEMORY_BACKEND = "memory"
 GCS_BACKEND = "gcs"
 DEFAULT_PORT = 8080
 
+COMFY_WORKFLOW_PLUGIN_ID = "comfy-workflow"
+
+
+def _comfy_workflow_schemas() -> CapabilitySchemas:
+    """The packaged workflow templates, read as schemas and nothing more.
+
+    The coordinator publishes what an approved worker can serve; it never builds
+    the plugin, so it opens no connection to anybody's local runtime. Imported
+    here so a coordinator that publishes only the reference capability needs no
+    `comfy` extra.
+    """
+    from outbound_gpu_worker_pool.comfy import (
+        PACKAGED_TEMPLATES_DIRECTORY,
+        TemplateRegistry,
+        capability_schemas,
+    )
+
+    return capability_schemas(
+        TemplateRegistry.from_directory(PACKAGED_TEMPLATES_DIRECTORY)
+    )
+
+
 # The schemas a coordinator publishes are exactly the ones the enabled plugins
 # declare: a capability cannot be advertised without a plugin that serves it.
-KNOWN_CAPABILITY_SCHEMAS: dict[str, CapabilitySchemas] = {
-    DETERMINISTIC_ECHO_PLUGIN_ID: capability_schemas_from_plugins(
+KNOWN_CAPABILITY_SCHEMAS: dict[str, Callable[[], CapabilitySchemas]] = {
+    DETERMINISTIC_ECHO_PLUGIN_ID: lambda: capability_schemas_from_plugins(
         (DeterministicEchoPlugin(),)
     ),
+    COMFY_WORKFLOW_PLUGIN_ID: _comfy_workflow_schemas,
 }
 
 
@@ -170,7 +193,7 @@ def _capability_schemas(names: str) -> CapabilitySchemas:
         known = KNOWN_CAPABILITY_SCHEMAS.get(plugin_id)
         if known is None:
             raise ValueError(f"unknown capability plugin: {plugin_id}")
-        schemas.update(known)
+        schemas.update(known())
     if not schemas:
         raise ValueError("OGWP_CAPABILITY_PLUGINS must name at least one plugin")
     return schemas
