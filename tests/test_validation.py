@@ -131,9 +131,11 @@ def test_submission_accepts_the_default_bounds() -> None:
         ("output_key", {"output_key": ""}),
         ("output_key", {"output_key": "o" * 1025}),
         ("tenant_id", {"tenant_id": ""}),
-        ("input_keys", {"input_keys": ()}),
         ("input_keys", {"input_keys": ("",)}),
+        ("input_keys", {"input_keys": (7,)}),
+        ("input_keys", {"input_keys": ("i" * 1025,)}),
         ("input_keys", {"input_keys": tuple(f"inputs/{n}" for n in range(17))}),
+        ("input_keys", {"input_keys": ("inputs/pool/a.bin", "inputs/pool/a.bin")}),
     ],
 )
 def test_submission_rejects_out_of_bound_fields(
@@ -141,6 +143,11 @@ def test_submission_rejects_out_of_bound_fields(
 ) -> None:
     with pytest.raises(ValueError, match=label):
         validate_job_submission(_submission(**overrides))
+
+
+def test_submission_accepts_no_input_keys() -> None:
+    """A text-only capability leases with zero inputs."""
+    validate_job_submission(_submission(input_keys=()))
 
 
 def test_submission_rejects_an_invalid_payload() -> None:

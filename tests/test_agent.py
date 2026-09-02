@@ -392,6 +392,23 @@ async def test_a_several_inputs_are_hashed_in_key_order(tmp_path: Path) -> None:
         assert plugin.inputs == dict(zip(job.input_keys, job.sources, strict=True))
 
 
+async def test_a_job_without_inputs_hashes_the_empty_digest(tmp_path: Path) -> None:
+    async with _harness(tmp_path / "workspaces") as harness:
+        job = await harness.submit(input_count=0)
+
+        assert await harness.agent.run_once() is AgentOutcome.COMPLETED
+
+        assert job.input_keys == ()
+        assert harness.transfer.downloads == []
+        assert harness.assets.assets[job.output_key] == (
+            _expected_output((), "job-1", 7)
+        )
+        assert (
+            hashlib.sha256(b"").hexdigest().encode()
+            in harness.assets.assets[job.output_key]
+        )
+
+
 async def test_b_a_replayed_submission_is_one_job_published_once(
     tmp_path: Path,
 ) -> None:

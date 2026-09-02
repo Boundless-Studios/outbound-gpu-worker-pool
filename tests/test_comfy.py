@@ -773,3 +773,37 @@ async def test_the_plugin_completes_one_h3_job_through_the_worker_agent(
     graph = fake.graphs[0]
     assert fake.uploaded_names == [f"{record.job_id}-first_frame.png"]
     assert graph[H3_OUTPUT_NODE]["inputs"]["filename_prefix"] == f"ogwp/{record.job_id}"
+
+
+async def test_the_plugin_completes_a_text_only_h3_job_with_no_granted_inputs(
+    tmp_path: Path,
+) -> None:
+    fake = _FakeComfy(histories=[_history(), _history(completed=True)])
+
+    async with httpx.AsyncClient(transport=fake.transport()) as client:
+        plugin = ComfyWorkflowPlugin(
+            _packaged(), client=client, poll_interval_seconds=0.0
+        )
+        async with _harness(tmp_path / "workspaces", plugins=(plugin,)) as harness:
+            record = await harness.service.submit(
+                JobSubmission(
+                    job_id=str(uuid4()),
+                    idempotency_key="pool:h3-text",
+                    capability_id=H3_CAPABILITY,
+                    input_keys=(),
+                    output_key=OUTPUT_KEY,
+                    payload={"prompt": PROMPT_TEXT},
+                    tenant_id="tenant-a",
+                )
+            )
+
+            outcome = await harness.agent.run_once()
+
+    assert outcome is AgentOutcome.COMPLETED
+    assert harness.jobs.records[record.job_id].status is JobStatus.COMPLETED
+    assert harness.assets.assets[OUTPUT_KEY] == VIEW_BODY
+    assert harness.transfer.downloads == []
+    graph = fake.graphs[0]
+    assert fake.uploaded_names == []
+    assert H3_FIRST_FRAME_NODE not in graph
+    assert graph[H3_CONDITIONING_NODE]["inputs"]["prompt"] == PROMPT_TEXT

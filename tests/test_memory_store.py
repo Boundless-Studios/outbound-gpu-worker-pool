@@ -88,6 +88,21 @@ async def test_concurrent_workers_never_share_a_lease() -> None:
     assert record.lease_until is not None
 
 
+async def test_job_without_inputs_round_trips_through_a_lease() -> None:
+    store = MemoryJobStore()
+    job_id = await _submit(store, "textonly", input_keys=())
+
+    record = await store.get(job_id)
+    assert record is not None
+    assert record.input_keys == ()
+    lease = await store.lease(
+        worker_id="worker-0", capability_ids=(ECHO,), lease_seconds=600
+    )
+    assert lease is not None
+    assert lease.job_id == job_id
+    assert lease.input_keys == ()
+
+
 async def test_lease_order_is_priority_then_oldest() -> None:
     store = MemoryJobStore()
     oldest_normal = await _submit(store, "old")

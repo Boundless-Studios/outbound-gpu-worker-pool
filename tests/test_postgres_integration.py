@@ -152,6 +152,22 @@ async def test_concurrent_workers_never_share_a_lease(
     assert record.request_digest == granted[0].request_digest
 
 
+async def test_job_without_inputs_round_trips_through_a_lease(
+    pool_fixture: PoolFixture,
+) -> None:
+    job_id = await _submit(pool_fixture, "textonly", input_keys=())
+
+    record = await pool_fixture.jobs.get(job_id)
+    assert record is not None
+    assert record.input_keys == ()
+    lease = await pool_fixture.jobs.lease(
+        worker_id="worker-0", capability_ids=(ECHO,), lease_seconds=600
+    )
+    assert lease is not None
+    assert lease.job_id == job_id
+    assert lease.input_keys == ()
+
+
 async def test_second_queued_job_goes_to_the_other_worker(
     pool_fixture: PoolFixture,
 ) -> None:
