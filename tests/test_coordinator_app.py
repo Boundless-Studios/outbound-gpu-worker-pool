@@ -23,12 +23,14 @@ from outbound_gpu_worker_pool import (
 )
 from outbound_gpu_worker_pool import coordinator_main
 from outbound_gpu_worker_pool.coordinator import create_coordinator_app
-from outbound_gpu_worker_pool.service import (
-    DEFAULT_CAPABILITY_SCHEMAS,
-    WorkerPoolService,
+from outbound_gpu_worker_pool.plugins import (
+    DeterministicEchoPlugin,
+    capability_schemas_from_plugins,
 )
+from outbound_gpu_worker_pool.service import WorkerPoolService
 
 ECHO = DETERMINISTIC_ECHO_CAPABILITY
+ECHO_SCHEMAS = capability_schemas_from_plugins((DeterministicEchoPlugin(),))
 TOKEN_DIGEST = hashlib.sha256(b"token-a").hexdigest()
 BASE_ENVIRONMENT = {
     "OGWP_DATABASE_URL": "postgresql://coordinator.invalid/pool",
@@ -58,7 +60,7 @@ def _service(**options: object) -> WorkerPoolService:
         MemoryWorkerAuthenticator(
             {"token-a": WorkerIdentity("worker-a", "static:worker-a", "static")}
         ),
-        DEFAULT_CAPABILITY_SCHEMAS,
+        ECHO_SCHEMAS,
         **options,  # type: ignore[arg-type]
     )
 
