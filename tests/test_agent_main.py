@@ -29,6 +29,14 @@ def test_a_static_configuration_builds_a_bearer_credentialled_agent() -> None:
     assert agent.capability_ids == ("test.deterministic.echo.v1",)
 
 
+def test_a_the_comfy_plugin_is_built_from_the_packaged_templates() -> None:
+    agent = agent_main.build_agent_from_env(
+        STATIC_ENVIRONMENT | {"OGWP_WORKER_PLUGINS": "comfy-workflow"}
+    )
+
+    assert agent.capability_ids == ("video.minimax_h3.text_to_video.v1",)
+
+
 @pytest.mark.parametrize(
     "environment",
     [
