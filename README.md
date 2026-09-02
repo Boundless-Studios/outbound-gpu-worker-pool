@@ -1,13 +1,270 @@
 # outbound-gpu-worker-pool
 
-Outbound-only, pull-based GPU worker pool. Workers on trusted machines open no ports and hold
-no bucket or database credentials; they poll an authenticated coordinator, lease one job,
-download inputs through job-scoped signed URLs, run an approved plugin, upload the output
-through a create-once grant, and commit an attested result that the coordinator verifies
-before the job is marked complete.
+Run GPU work on machines you trust without exposing them. A worker opens no port and holds
+no bucket or database credential: it polls an authenticated coordinator over outbound HTTPS,
+leases one job, downloads its inputs through job-scoped signed URLs, runs an approved plugin
+in a per-job workspace, uploads the artifact through a create-once grant, and attests the
+result. The coordinator verifies that attestation against the stored object before the job is
+marked complete. PostgreSQL is the only durable state; there is no broker, no VPN, and no
+inbound call to a worker, ever.
 
-Status: alpha, slice 1 (durable capability leases, coordinator API, deterministic reference
-plugin and agent). See [`docs/design.md`](docs/design.md) for the architecture, trust
-boundaries, failure semantics, and rollout plan.
+## Trust model
 
-Library extraction in progress; see [`docs/plans/2026-09-02-extract-library.md`](docs/plans/2026-09-02-extract-library.md).
+- **The coordinator never calls a worker.** Every lease, heartbeat, and commit is an outbound
+  request the worker makes and the coordinator authenticates.
+- **A worker holds one credential and nothing else.** No bucket key, no database URL, no
+  provider secret. Its identity is per machine, so revoking one worker touches no other.
+- **A worker never chooses what it touches.** URLs, keys, and payloads arrive inside a signed
+  lease grant: exact object, single method, short-lived, with no list permission.
+- **The coordinator verifies before it commits.** A completion is accepted only when the
+  manifest's output key, idempotency key, and canonical request digest match the job row, the
+  publication mode is `immutable_create_once`, and the stored object's size and sha256 match
+  the attestation. Any mismatch fails the job terminally.
+- **Nothing sensitive is written down.** Audit rows and logs carry ids, counts, digests,
+  statuses, and durations — never a credential, a signed URL, a prompt, or asset bytes.
+
+## Install
+
+```bash
+pip install outbound-gpu-worker-pool[coordinator]   # asyncpg + fastapi, the server side
+pip install outbound-gpu-worker-pool[agent]         # httpx, the worker side
+pip install outbound-gpu-worker-pool[gcs]           # Google Cloud Storage asset store
+pip install outbound-gpu-worker-pool[google-auth]   # verify or mint Google identity tokens
+```
+
+The core package depends only on `pydantic`, so a worker machine installs no server code and
+a coordinator installs no HTTP client.
+
+## Quickstart
+
+Coordinator and worker in one process, on in-memory stores. This is the whole round trip —
+submit, lease, download, execute, publish, verify — and it runs as
+`tests/test_readme_quickstart.py`, so it cannot drift from the library.
+
+```python
+import asyncio
+import tempfile
+from pathlib import Path
+from uuid import uuid4
+
+import httpx
+
+from outbound_gpu_worker_pool import (
+    DETERMINISTIC_ECHO_CAPABILITY,
+    JobSubmission,
+    MemoryAssetStore,
+    MemoryAssetTransfer,
+    MemoryAuditLog,
+    MemoryJobStore,
+    MemoryWorkerAuthenticator,
+    MemoryWorkerRegistry,
+    WorkerIdentity,
+)
+from outbound_gpu_worker_pool.agent import WorkerAgent
+from outbound_gpu_worker_pool.coordinator import create_coordinator_app
+from outbound_gpu_worker_pool.plugins import (
+    DeterministicEchoPlugin,
+    capability_schemas_from_plugins,
+)
+from outbound_gpu_worker_pool.service import WorkerPoolService
+
+
+async def main() -> None:
+    assets = MemoryAssetStore()
+    await assets.write_once("inputs/hello.bin", b"hello worker pool", "application/octet-stream")
+
+    plugins = (DeterministicEchoPlugin(),)
+    service = WorkerPoolService(
+        MemoryJobStore(),
+        assets,
+        MemoryWorkerRegistry(),
+        MemoryAuditLog(),
+        MemoryWorkerAuthenticator(
+            {"worker-token": WorkerIdentity("worker-a", "static:worker-a", "static")}
+        ),
+        capability_schemas_from_plugins(plugins),
+    )
+
+    submitted = await service.submit(
+        JobSubmission(
+            job_id=str(uuid4()),
+            idempotency_key="quickstart-1",
+            capability_id=DETERMINISTIC_ECHO_CAPABILITY,
+            input_keys=("inputs/hello.bin",),
+            output_key="outputs/hello.txt",
+            payload={"seed": 7, "label": "quickstart"},
+        )
+    )
+
+    with tempfile.TemporaryDirectory() as workspace:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=create_coordinator_app(service)),
+            base_url="http://coordinator",
+        ) as http:
+            agent = WorkerAgent(
+                coordinator_url="http://coordinator",
+                worker_id="worker-a",
+                credential=lambda: "worker-token",
+                plugins=plugins,
+                transfer=MemoryAssetTransfer(assets),
+                http=http,
+                workspace_root=Path(workspace),
+            )
+            outcome = await agent.run_once()
+
+    record = await service.get(submitted.job_id)
+    print(f"{outcome} -> {record.status}")
+    print((await assets.read_limited(record.output_key, 1_000_000)).decode())
+
+
+asyncio.run(main())
+```
+
+In production the two halves are separate processes: replace the memory stores with
+`PostgresJobStore`, `PostgresWorkerRegistry`, `PostgresAuditLog`, and `GcsAssetStore`, and
+replace `MemoryAssetTransfer` with `HttpAssetTransfer`.
+
+## Using it from your own application
+
+The library ships **no product routes**. Job submission is a service call your own
+authenticated handler makes, so tenancy, quotas, and authorization stay yours:
+
+```python
+record = await service.submit(submission)     # insert, or replay an equal submission
+record = await service.get(job_id)            # never carries the lease claim token
+cancelled = await service.cancel(job_id)      # queued or processing only
+records = await service.list_for_tenant(tenant_id)
+```
+
+Worker administration is service calls too: `set_worker_status(worker_id, status)`,
+`list_workers()`, and `audit_for_job(job_id)` for the redacted trail. What the library does
+publish over HTTP is the authenticated worker surface: mount `create_worker_router(service)`
+next to your own routes, or run `create_coordinator_app(service)` as its own deployment when
+workers should reach a service that holds nothing else.
+
+`PostgresJobStore.start()` applies the migrations in `migrations/001_worker_pool.sql` under an
+advisory lock, creating `pool_jobs`, `pool_workers`, and `pool_audit_events`. Every table name
+is a module constant so your own reporting can read them.
+
+## Enrolling a worker
+
+**Static tokens** (development, or a single machine). Generate the token and its digest, keep
+the token on the worker machine only, and enroll the digest with the coordinator:
+
+```bash
+python -c "import secrets,hashlib; t=secrets.token_urlsafe(32); print(t, hashlib.sha256(t.encode()).hexdigest())"
+```
+
+Put `worker-id:<digest>` in the coordinator's `OGWP_WORKER_TOKENS` (comma separated for
+several workers) and give the worker the token itself as `OGWP_WORKER_TOKEN`. The coordinator
+stores digests only.
+
+**Google OIDC** (one service account per machine — never a shared account, because the
+identity subject is what revocation targets). The machine's identity token must carry a
+verified `email` claim equal to the `identity_subject` of its registry row, so insert that row
+before the first heartbeat:
+
+```sql
+INSERT INTO pool_workers (worker_id, identity_subject)
+VALUES ('gpu-01', 'gpu-01@<project>.iam.gserviceaccount.com')
+ON CONFLICT (worker_id) DO NOTHING;
+```
+
+Smoke-test the credential from the machine with
+`gcloud auth print-identity-token --audiences=<audience>`. If the coordinator runs as a
+private service, the worker's service account also needs permission to invoke it.
+
+## Revoking a worker
+
+Revocation is independent of the credential and takes effect on the worker's next request:
+
+```python
+await service.set_worker_status("gpu-01", WorkerStatus.REVOKED)
+```
+
+A revoked worker gets `403` on every `/worker/v1` route even with a valid credential, stays
+revoked across heartbeats, and leaves every other worker untouched. `WorkerStatus.DRAINING`
+is the softer form: the worker keeps its in-flight job but is granted no new lease.
+
+## Running the coordinator
+
+```bash
+OGWP_DATABASE_URL=postgresql://... \
+OGWP_ASSET_BUCKET=my-pool-assets \
+OGWP_WORKER_AUTH=static \
+OGWP_WORKER_TOKENS=gpu-01:<sha256 hex> \
+python -m outbound_gpu_worker_pool.coordinator_main
+```
+
+| Variable | Values | Meaning |
+|---|---|---|
+| `OGWP_JOB_BACKEND` | `postgres` (default), `memory` | where jobs, workers, and audit rows live |
+| `OGWP_DATABASE_URL` | connection URL | required for `postgres` |
+| `OGWP_ASSET_BACKEND` | `gcs` (default), `memory` | which asset store mints grants |
+| `OGWP_ASSET_BUCKET` | bucket name | required for `gcs` |
+| `OGWP_SIGNING_SERVICE_ACCOUNT` | service account email | signs grant URLs when the runtime identity cannot |
+| `OGWP_ALLOWED_READ_PREFIXES` | comma separated, default `inputs/,outputs/` | the only prefixes a read grant may address |
+| `OGWP_ALLOWED_OUTPUT_PREFIXES` | comma separated, default `outputs/` | the only prefixes an upload grant may address |
+| `OGWP_WORKER_AUTH` | `static` (default), `google_oidc` | how a worker credential is resolved; there is no `none` |
+| `OGWP_WORKER_TOKENS` | `worker-id:<sha256 hex>[,...]` | required for `static`; digests only |
+| `OGWP_WORKER_AUDIENCE` | audience string | required for `google_oidc` |
+| `OGWP_CAPABILITY_PLUGINS` | comma separated, default `deterministic-echo` | the plugins whose schemas this coordinator publishes |
+| `OGWP_PORT` | default `8080` | listen port |
+
+## Running the agent
+
+```bash
+OGWP_WORKER_COORDINATOR_URL=https://<coordinator-host> \
+OGWP_WORKER_ID=gpu-01 \
+OGWP_WORKER_AUTH=static \
+OGWP_WORKER_TOKEN=<token> \
+OGWP_WORKER_PLUGINS=deterministic-echo \
+OGWP_WORKER_WORKSPACE=/var/tmp/outbound-gpu-worker \
+python -m outbound_gpu_worker_pool.agent_main
+```
+
+| Variable | Values | Meaning |
+|---|---|---|
+| `OGWP_WORKER_COORDINATOR_URL` | URL | required; the only host the agent talks to |
+| `OGWP_WORKER_ID` | worker id | required; must match the enrolled row |
+| `OGWP_WORKER_AUTH` | `static` (default), `google_oidc` | credential source |
+| `OGWP_WORKER_TOKEN` | the token itself | required for `static` |
+| `OGWP_WORKER_AUDIENCE` | audience string | required for `google_oidc`; a fresh identity token is minted per request |
+| `OGWP_WORKER_PLUGINS` | comma separated, default `deterministic-echo` | the plugins this machine is approved to run |
+| `OGWP_WORKER_CONCURRENCY` | default `1` | leases this machine advertises per capability |
+| `OGWP_WORKER_WORKSPACE` | path, default `<tmpdir>/outbound-gpu-worker` | per-job workspaces are created and deleted under here |
+| `OGWP_WORKER_GPU_MODEL` | free text | advertised to the registry |
+| `OGWP_WORKER_VRAM_MB` | integer | advertised to the registry |
+
+SIGTERM and SIGINT drain: the in-flight job finishes, a final draining heartbeat is sent, and
+the process exits 0. A lease taken as draining begins is released back to the pool rather than
+started.
+
+Writing your own plugin means implementing `GpuExecutorPlugin` — `capabilities()`,
+`validate(lease)`, `execute(context, request)`, `cancel(job_id)`, `health()` — and naming it in
+`OGWP_WORKER_PLUGINS`. `validate` is the terminal gate: it runs before a single byte is
+downloaded. `DeterministicEchoPlugin` is the reference implementation and the round-trip probe.
+
+## Failure semantics
+
+**Retryable — released, not failed.** A transport or execution failure, a lost lease, a
+draining worker, or a temporary storage failure releases the job. It returns to the queue
+without a further attempt being charged and another worker picks it up, until the attempt
+budget is spent; then it settles as `failed` with `retryable=true` so an operator can decide.
+
+**Terminal — failed on the spot.** A capability or contract version no plugin serves, a
+payload a plugin rejects (`PluginRequestRejected`), or an attestation that does not match the
+job row fails the job with `retryable=false`. These cost one attempt at most, because a retry
+would fail identically.
+
+Publication is create-once, so a retried attempt that already uploaded its artifact is a
+replay rather than an overwrite: the upload's `412` is treated as already-published.
+
+## Design
+
+[`docs/design.md`](docs/design.md) has the architecture, the trust boundaries, the
+alternatives that were rejected, and the rollout plan.
+
+Status: alpha, slice 1 of the design's rollout — durable capability leases, the authenticated
+coordinator API, job-scoped asset grants with verified immutable outputs, and the deterministic
+reference plugin and agent.

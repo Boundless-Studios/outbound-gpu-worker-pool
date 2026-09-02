@@ -32,12 +32,14 @@ from outbound_gpu_worker_pool import (
 )
 from outbound_gpu_worker_pool import routes as routes_module
 from outbound_gpu_worker_pool.coordinator import create_coordinator_app
-from outbound_gpu_worker_pool.service import (
-    DEFAULT_CAPABILITY_SCHEMAS,
-    WorkerPoolService,
+from outbound_gpu_worker_pool.plugins import (
+    DeterministicEchoPlugin,
+    capability_schemas_from_plugins,
 )
+from outbound_gpu_worker_pool.service import WorkerPoolService
 
 ECHO = DETERMINISTIC_ECHO_CAPABILITY
+ECHO_SCHEMAS = capability_schemas_from_plugins((DeterministicEchoPlugin(),))
 OTHER = "pool.other.capability.v1"
 OUTPUT_BYTES = b"deterministic-echo/v1\nlabel=job-1\nseed=7\n"
 
@@ -75,7 +77,7 @@ def _harness(
         registry,
         audit,
         authenticator,
-        DEFAULT_CAPABILITY_SCHEMAS,
+        ECHO_SCHEMAS,
         **service_options,  # type: ignore[arg-type]
     )
     return _Harness(

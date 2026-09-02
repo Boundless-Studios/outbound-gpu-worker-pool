@@ -18,7 +18,6 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 from outbound_gpu_worker_pool.contracts import (
-    DETERMINISTIC_ECHO_CAPABILITY,
     MAX_AUDIT_REASON_LENGTH,
     PUBLICATION_MODE_IMMUTABLE_CREATE_ONCE,
     AssetGrant,
@@ -26,7 +25,6 @@ from outbound_gpu_worker_pool.contracts import (
     AuditEvent,
     AuditEventType,
     AuditLog,
-    CapabilitySchema,
     CapabilitySchemas,
     IdentitySubjectTaken,
     JobFailureCode,
@@ -49,21 +47,6 @@ from outbound_gpu_worker_pool.validation import validate_capability_id
 
 OUTPUT_UPLOAD_CONTENT_TYPE = "application/octet-stream"
 GLOBAL_RATE_LIMIT_KEY = "*"
-
-DEFAULT_CAPABILITY_SCHEMAS: CapabilitySchemas = {
-    DETERMINISTIC_ECHO_CAPABILITY: CapabilitySchema(
-        capability_id=DETERMINISTIC_ECHO_CAPABILITY,
-        contract_version=1,
-        input_schema={
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "seed": {"type": "integer", "minimum": 0},
-                "label": {"type": "string", "maxLength": 64},
-            },
-        },
-    )
-}
 
 
 class RateLimited(RuntimeError):

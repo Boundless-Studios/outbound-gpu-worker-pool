@@ -33,14 +33,18 @@ from outbound_gpu_worker_pool import (
     WorkerStatus,
     job_request_digest,
 )
+from outbound_gpu_worker_pool.plugins import (
+    DeterministicEchoPlugin,
+    capability_schemas_from_plugins,
+)
 from outbound_gpu_worker_pool.service import (
-    DEFAULT_CAPABILITY_SCHEMAS,
     OUTPUT_UPLOAD_CONTENT_TYPE,
     CompletionRejected,
     WorkerPoolService,
 )
 
 ECHO = DETERMINISTIC_ECHO_CAPABILITY
+ECHO_SCHEMAS = capability_schemas_from_plugins((DeterministicEchoPlugin(),))
 OUTPUT_BYTES = b"deterministic-echo/v1\nlabel=job-1\nseed=7\n"
 WORKER_A = WorkerIdentity("worker-a", "static:worker-a", "static")
 
@@ -77,7 +81,7 @@ def _harness(**options: object) -> _Harness:
         registry,
         audit,
         MemoryWorkerAuthenticator({"token-a": WORKER_A}),
-        DEFAULT_CAPABILITY_SCHEMAS,
+        ECHO_SCHEMAS,
         **options,  # type: ignore[arg-type]
     )
     return _Harness(

@@ -37,26 +37,29 @@ from outbound_gpu_worker_pool.memory import (
     MemoryJobStore,
     MemoryWorkerRegistry,
 )
+from outbound_gpu_worker_pool.plugins import (
+    DETERMINISTIC_ECHO_PLUGIN_ID,
+    DeterministicEchoPlugin,
+    capability_schemas_from_plugins,
+)
 from outbound_gpu_worker_pool.postgres import (
     PostgresAuditLog,
     PostgresJobStore,
     PostgresWorkerRegistry,
 )
-from outbound_gpu_worker_pool.service import (
-    DEFAULT_CAPABILITY_SCHEMAS,
-    WorkerPoolService,
-)
+from outbound_gpu_worker_pool.service import WorkerPoolService
 
 POSTGRES_BACKEND = "postgres"
 MEMORY_BACKEND = "memory"
 GCS_BACKEND = "gcs"
 DEFAULT_PORT = 8080
-DETERMINISTIC_ECHO_PLUGIN_ID = "deterministic-echo"
 
-# Task 3 registers its plugins here; the schemas a coordinator publishes are
-# exactly the ones the enabled plugins declare.
+# The schemas a coordinator publishes are exactly the ones the enabled plugins
+# declare: a capability cannot be advertised without a plugin that serves it.
 KNOWN_CAPABILITY_SCHEMAS: dict[str, CapabilitySchemas] = {
-    DETERMINISTIC_ECHO_PLUGIN_ID: DEFAULT_CAPABILITY_SCHEMAS,
+    DETERMINISTIC_ECHO_PLUGIN_ID: capability_schemas_from_plugins(
+        (DeterministicEchoPlugin(),)
+    ),
 }
 
 

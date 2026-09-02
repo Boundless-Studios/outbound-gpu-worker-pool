@@ -8,6 +8,7 @@ run the whole pool in one process for tests and local development.
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from uuid import uuid4
 
 from outbound_gpu_worker_pool.contracts import (
@@ -294,6 +295,32 @@ class MemoryAssetStore:
 
 
 @dataclass
+class MemoryAssetTransfer:
+    """Moves bytes between a MemoryAssetStore and a worker workspace.
+
+    This is the agent's `AssetTransfer` seam without a network: it resolves the
+    grant URLs `MemoryAssetStore` mints and nothing else.
+    """
+
+    store: MemoryAssetStore
+    downloads: list[str] = field(default_factory=list)
+    uploads: list[str] = field(default_factory=list)
+
+    async def download(self, url: str, destination: Path) -> int:
+        key = _grant_key(url, MEMORY_READ_PREFIX)
+        content = await self.store.read(key)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(content)
+        self.downloads.append(key)
+        return len(content)
+
+    async def upload(self, url: str, source: Path, content_type: str) -> None:
+        key = _grant_key(url, MEMORY_UPLOAD_PREFIX)
+        await self.store.write_once(key, source.read_bytes(), content_type)
+        self.uploads.append(key)
+
+
+@dataclass
 class MemoryWorkerRegistry:
     workers: dict[str, WorkerRecord] = field(default_factory=dict)
 
@@ -393,6 +420,16 @@ class MemoryWorkerAuthenticator:
         if identity is None:
             raise WorkerAuthError("unknown worker credential")
         return identity
+
+
+def _grant_key(url: str, prefix: str) -> str:
+    if not url.startswith(prefix):
+        # Imported here so the core package still installs without the `agent`
+        # extra: only a worker that moves bytes ever reaches this branch.
+        from outbound_gpu_worker_pool.agent import TransferError
+
+        raise TransferError("asset grant is not addressable in memory")
+    return url.removeprefix(prefix)
 
 
 def _require_prefix(key: str, prefixes: tuple[str, ...], grant: str) -> None:
