@@ -1,0 +1,28 @@
+[Unit]
+Description=Outbound GPU worker agent
+Documentation=https://github.com/Boundless-Studios/outbound-gpu-worker-pool/blob/main/docs/operations.md
+# There is nothing to wait for on this machine: the agent dials out, and it
+# backs off on its own while the coordinator is unreachable.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.local/share/outbound-gpu-worker/agent.env
+ExecStart=%h/.local/share/outbound-gpu-worker/venv/bin/python -m outbound_gpu_worker_pool.agent_main
+Restart=always
+RestartSec=10
+# Stopping is a drain, not a kill: SIGTERM lets the in-flight job finish and a
+# final draining heartbeat land. A job may run for 20 minutes, so wait longer.
+KillSignal=SIGTERM
+TimeoutStopSec=1500
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+# The agent's own home is the only thing it writes: the venv, the workspace it
+# creates and deletes per job, and the templates the operator curates.
+ReadWritePaths=%h/.local/share/outbound-gpu-worker
+
+[Install]
+WantedBy=default.target

@@ -17,7 +17,11 @@ from pathlib import Path
 
 import httpx
 
-from outbound_gpu_worker_pool.agent import HttpAssetTransfer, WorkerAgent
+from outbound_gpu_worker_pool.agent import (
+    DEFAULT_MAX_INPUT_BYTES,
+    HttpAssetTransfer,
+    WorkerAgent,
+)
 from outbound_gpu_worker_pool.plugins import (
     DETERMINISTIC_ECHO_PLUGIN_ID,
     DeterministicEchoPlugin,
@@ -99,6 +103,9 @@ def build_agent_from_env(environment: Mapping[str, str]) -> WorkerAgent:
         http=httpx.AsyncClient(timeout=COORDINATOR_TIMEOUT_SECONDS),
         workspace_root=workspace_root,
         concurrency=int(environment.get("OGWP_WORKER_CONCURRENCY", "1")),
+        max_input_bytes=int(
+            environment.get("OGWP_WORKER_MAX_INPUT_BYTES", DEFAULT_MAX_INPUT_BYTES)
+        ),
         gpu_model=environment.get("OGWP_WORKER_GPU_MODEL"),
         vram_mb=int(vram_mb) if vram_mb else None,
     )

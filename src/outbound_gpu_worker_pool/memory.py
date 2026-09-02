@@ -299,14 +299,18 @@ class MemoryAssetTransfer:
     """Moves bytes between a MemoryAssetStore and a worker workspace.
 
     This is the agent's `AssetTransfer` seam without a network: it resolves the
-    grant URLs `MemoryAssetStore` mints and nothing else.
+    grant URLs `MemoryAssetStore` mints and nothing else. It accepts the caller's
+    `max_bytes` for protocol conformance but has no stream to stop; the agent
+    enforces the bound on what it is handed back.
     """
 
     store: MemoryAssetStore
     downloads: list[str] = field(default_factory=list)
     uploads: list[str] = field(default_factory=list)
 
-    async def download(self, url: str, destination: Path) -> int:
+    async def download(
+        self, url: str, destination: Path, max_bytes: int | None = None
+    ) -> int:
         key = _grant_key(url, MEMORY_READ_PREFIX)
         content = await self.store.read(key)
         destination.parent.mkdir(parents=True, exist_ok=True)

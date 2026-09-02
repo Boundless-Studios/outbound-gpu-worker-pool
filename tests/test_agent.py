@@ -36,6 +36,7 @@ from outbound_gpu_worker_pool import (
     WorkerStatus,
 )
 from outbound_gpu_worker_pool.agent import (
+    DEFAULT_MAX_INPUT_BYTES,
     AgentOutcome,
     HttpAssetTransfer,
     TransferError,
@@ -169,7 +170,9 @@ class _RecordingPlugin(_EchoDelegate):
 class _FailingDownloadTransfer(MemoryAssetTransfer):
     """A transport whose input download never lands."""
 
-    async def download(self, url: str, destination: Path) -> int:
+    async def download(
+        self, url: str, destination: Path, max_bytes: int | None = None
+    ) -> int:
         raise TransferError("asset download failed with status 500")
 
 
@@ -295,6 +298,7 @@ async def _harness(
     transfer_factory: Callable[[MemoryAssetStore], MemoryAssetTransfer] = (
         MemoryAssetTransfer
     ),
+    max_input_bytes: int = DEFAULT_MAX_INPUT_BYTES,
 ) -> AsyncIterator[_Harness]:
     jobs = MemoryJobStore()
     assets = MemoryAssetStore()
@@ -340,6 +344,7 @@ async def _harness(
                 transfer=transfer,
                 http=http,
                 workspace_root=workspace_root,
+                max_input_bytes=max_input_bytes,
                 min_poll_seconds=0.01,
                 max_poll_seconds=0.04,
                 random=lambda: 1.0,
@@ -487,6 +492,25 @@ async def test_d_a_failed_input_download_releases_the_job(tmp_path: Path) -> Non
         assert record.attempts == 1
         assert record.leased_by is None
         assert harness.assets.publish_count == 0
+
+
+async def test_d_an_input_over_the_scratch_bound_releases_the_job(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspaces"
+    # Every seeded input is longer than this, so the first one trips the bound.
+    async with _harness(root, max_input_bytes=4) as harness:
+        job = await harness.submit()
+
+        outcome = await harness.agent.run_once()
+
+        assert outcome is AgentOutcome.RELEASED
+        record = harness.jobs.records[job.job_id]
+        assert record.status is JobStatus.QUEUED
+        assert record.attempts == 1
+        assert harness.assets.publish_count == 0
+        # Nothing oversized is left behind on the machine's scratch disk.
+        assert not (root / job.job_id).exists()
 
 
 async def test_d_a_plugin_rejection_during_execution_is_terminal(
@@ -675,3 +699,24 @@ async def test_h_a_failed_transfer_raises_without_naming_the_url(
 
     assert "storage.invalid" not in str(download_error.value)
     assert "storage.invalid" not in str(upload_error.value)
+
+
+async def test_h_a_download_stops_before_it_passes_the_byte_bound(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "asset.bin"
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, content=b"x" * 64)
+        )
+    ) as client:
+        with pytest.raises(TransferError) as error:
+            await HttpAssetTransfer(client).download(
+                "https://storage.invalid/read", destination, max_bytes=16
+            )
+
+    # The chunk that would pass the bound is never written, so a machine with a
+    # small scratch disk cannot be filled by one oversized input.
+    assert destination.stat().st_size <= 16
+    assert "storage.invalid" not in str(error.value)
