@@ -158,7 +158,7 @@ async def test_submit_validates_the_submission() -> None:
     harness = _harness()
 
     with pytest.raises(ValueError):
-        await harness.service.submit(_submission(input_keys=()))
+        await harness.service.submit(_submission(input_keys=("",)))
 
 
 async def test_submit_stores_the_canonical_request_digest() -> None:

@@ -261,6 +261,21 @@ def test_a_lease_carries_scoped_grants_and_is_handed_out_once() -> None:
     ]
 
 
+def test_a_lease_without_inputs_grants_none() -> None:
+    harness = _harness()
+    job_id = submit_pool_job(harness, input_keys=())
+    heartbeat(harness.client, "token-a", "worker-a")
+
+    granted = _lease(harness.client, "token-a")
+
+    assert granted.status_code == 200
+    body = granted.json()
+    assert body["job_id"] == job_id
+    assert body["input_keys"] == []
+    assert body["input_grants"] == []
+    assert body["output_grant"]["key"] == harness.jobs.records[job_id].output_key
+
+
 def test_a_lease_never_exposes_the_tenant() -> None:
     harness = _harness()
     _job_id, grant = _leased(harness)

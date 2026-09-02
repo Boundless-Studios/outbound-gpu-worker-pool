@@ -165,7 +165,8 @@ class DeterministicEchoPlugin:
         self, context: ExecutionContext, request: ValidatedRequest
     ) -> PluginOutput:
         # Key order, not arrival order: two workers given the same job must
-        # produce the same bytes.
+        # produce the same bytes. A job with no inputs hashes the empty byte
+        # string, so its digest is sha256(b"").
         digest = hashlib.sha256(
             b"".join(
                 path.read_bytes() for _, path in sorted(context.input_paths.items())

@@ -25,7 +25,7 @@ type JobPayload = dict[str, JobPayloadValue]
 
 MAX_JOB_ID_LENGTH = 255
 MAX_ASSET_KEY_LENGTH = 1024
-MAX_JOB_INPUT_KEYS = 16
+MAX_JOB_INPUT_KEYS = 16  # upper bound only: a job may carry no input keys at all
 MAX_JOB_PAYLOAD_BYTES = 16_384
 MAX_JOB_PAYLOAD_DEPTH = 8
 MIN_JOB_PRIORITY = 0
