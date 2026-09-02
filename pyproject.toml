@@ -1,0 +1,64 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "outbound-gpu-worker-pool"
+version = "0.1.0"
+description = "Outbound-only, pull-based GPU worker pool: Postgres-backed capability leases, an authenticated coordinator API, job-scoped asset grants with verified immutable outputs, and a pluggable worker agent."
+readme = "README.md"
+requires-python = ">=3.13"
+license = "MIT"
+authors = [{ name = "Boundless Studios" }]
+keywords = ["gpu", "worker-pool", "job-queue", "postgres", "comfyui", "pull-based", "fastapi"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Distributed Computing",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+    "pydantic>=2.11",
+]
+
+[project.optional-dependencies]
+coordinator = [
+    "asyncpg>=0.30",
+    "fastapi>=0.115",
+]
+agent = [
+    "httpx>=0.28",
+]
+gcs = [
+    "google-cloud-storage>=3",
+    "google-auth>=2.38",
+]
+google-auth = [
+    "google-auth>=2.38",
+]
+dev = [
+    "asyncpg>=0.30",
+    "fastapi>=0.115",
+    "httpx>=0.28",
+    "google-cloud-storage>=3",
+    "google-auth>=2.38",
+    "pytest>=8",
+    "pytest-asyncio>=0.25",
+    "uvicorn>=0.30",
+]
+
+[project.urls]
+Homepage = "https://github.com/Boundless-Studios/outbound-gpu-worker-pool"
+Repository = "https://github.com/Boundless-Studios/outbound-gpu-worker-pool"
+Issues = "https://github.com/Boundless-Studios/outbound-gpu-worker-pool/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/outbound_gpu_worker_pool"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "tests"]
+asyncio_mode = "auto"
+testpaths = ["tests"]
