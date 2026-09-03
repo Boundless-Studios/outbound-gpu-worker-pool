@@ -43,8 +43,6 @@ from outbound_gpu_worker_pool.plugins import (
 
 logger = logging.getLogger(__name__)
 
-CREATE_ONCE_HEADER = "x-goog-if-generation-match"
-CREATE_ONCE_HEADER_VALUE = "0"
 CREATE_ONCE_CONFLICT_STATUS = 412
 DIGEST_CHUNK_BYTES = 1024 * 1024
 DRAIN_RELEASE_REASON = "draining"
@@ -108,13 +106,15 @@ class HttpAssetTransfer:
         return written
 
     async def upload(self, url: str, source: Path, content_type: str) -> None:
+        # Create-once is enforced by the signed ifGenerationMatch=0 query
+        # parameter the coordinator minted into the grant. A V4 signed URL
+        # rejects any x-goog-* header that was not part of the signature, so the
+        # transport must not add one; the only headers sent are the ones the
+        # signature covers.
         response = await self._client.put(
             url,
             content=source.read_bytes(),
-            headers={
-                "Content-Type": content_type,
-                CREATE_ONCE_HEADER: CREATE_ONCE_HEADER_VALUE,
-            },
+            headers={"Content-Type": content_type},
         )
         if response.status_code == CREATE_ONCE_CONFLICT_STATUS:
             return
