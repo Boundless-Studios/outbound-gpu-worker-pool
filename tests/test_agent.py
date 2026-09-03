@@ -679,7 +679,7 @@ async def test_h_http_asset_transfer_streams_and_creates_once(tmp_path: Path) ->
         assert destination.read_bytes() == b"source-bytes"
         upload = requests[-1]
         assert upload.method == "PUT"
-        assert upload.headers["x-goog-if-generation-match"] == "0"
+        assert "x-goog-if-generation-match" not in upload.headers
         assert upload.headers["content-type"] == "text/plain"
         assert upload.read() == b"payload"
 
