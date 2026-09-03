@@ -40,6 +40,7 @@ gcs = [
     "google-auth>=2.38",
 ]
 google-auth = [
+    "requests>=2.31",
     "google-auth>=2.38",
 ]
 dev = [
