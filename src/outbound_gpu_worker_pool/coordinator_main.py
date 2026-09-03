@@ -145,7 +145,10 @@ def build_from_env(environment: Mapping[str, str]) -> FastAPI:
         )
     else:
         authenticator = GoogleIdTokenWorkerAuthenticator(
-            audience=_required(environment, "OGWP_WORKER_AUDIENCE"), registry=registry
+            audience=_required(environment, "OGWP_WORKER_AUDIENCE"),
+            registry=registry,
+            auto_enroll=environment.get("OGWP_WORKER_AUTO_ENROLL", "false").lower()
+            == "true",
         )
     service = WorkerPoolService(
         jobs,

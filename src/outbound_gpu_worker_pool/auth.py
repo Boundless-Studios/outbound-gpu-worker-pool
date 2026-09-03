@@ -25,6 +25,8 @@ BEARER_PREFIX = "Bearer "
 STATIC_AUTH_METHOD = "static"
 GOOGLE_OIDC_AUTH_METHOD = "google_oidc"
 SHA256_HEX_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+DEFAULT_WORKER_ACCOUNT_PREFIX = "gpu-worker-"
+WORKER_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,127}$")
 
 
 def _bearer_credential(authorization: str | None) -> str:
@@ -86,10 +88,25 @@ class GoogleIdTokenWorkerAuthenticator:
         audience: str,
         registry: WorkerRegistry,
         verifier: Callable[[str, str], Mapping[str, object]] | None = None,
+        *,
+        auto_enroll: bool = False,
+        account_prefix: str = DEFAULT_WORKER_ACCOUNT_PREFIX,
     ) -> None:
+        """Resolve verified Google identities to workers.
+
+        With ``auto_enroll`` off (the default) a subject must already have a
+        registry row. With it on, an unknown subject is admitted and its worker id
+        is derived from the account name (``gpu-worker-<id>@...`` → ``<id>``); the
+        first heartbeat then creates the row. Turn it on only when something in
+        front of the coordinator already decides who may call it at all — for
+        example Cloud Run IAM granting ``run.invoker`` per machine — so that the
+        IAM grant is the admission decision and the registry tracks state.
+        """
         self._audience = audience
         self._registry = registry
         self._verifier = verifier if verifier is not None else _verify_google_id_token
+        self._auto_enroll = auto_enroll
+        self._account_prefix = account_prefix
 
     async def authenticate(self, authorization: str | None) -> WorkerIdentity:
         credential = _bearer_credential(authorization)
@@ -105,10 +122,29 @@ class GoogleIdTokenWorkerAuthenticator:
         if not isinstance(email, str) or not email:
             raise WorkerAuthError("identity token carries no email claim")
         record = await self._registry.find_by_identity_subject(email)
-        if record is None:
+        if record is not None:
+            worker_id = record.worker_id
+        elif self._auto_enroll:
+            worker_id = worker_id_from_account(email, self._account_prefix)
+        else:
             raise WorkerAuthError("identity subject is not enrolled")
         return WorkerIdentity(
-            worker_id=record.worker_id,
+            worker_id=worker_id,
             subject=email,
             method=GOOGLE_OIDC_AUTH_METHOD,
         )
+
+
+def worker_id_from_account(email: str, prefix: str = DEFAULT_WORKER_ACCOUNT_PREFIX) -> str:
+    """``gpu-worker-<id>@project.iam.gserviceaccount.com`` → ``<id>``.
+
+    Rejects anything that does not look like a per-machine service account so a
+    human or unrelated identity can never be admitted as a worker by accident.
+    """
+    local_part, separator, _domain = email.partition("@")
+    if not separator or not local_part.startswith(prefix):
+        raise WorkerAuthError("identity subject is not a worker account")
+    worker_id = local_part.removeprefix(prefix)
+    if WORKER_ID_PATTERN.match(worker_id) is None:
+        raise WorkerAuthError("identity subject does not name a valid worker id")
+    return worker_id

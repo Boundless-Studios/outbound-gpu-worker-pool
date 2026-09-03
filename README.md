@@ -209,6 +209,7 @@ python -m outbound_gpu_worker_pool.coordinator_main
 | `OGWP_WORKER_AUTH` | `static` (default), `google_oidc` | how a worker credential is resolved; there is no `none` |
 | `OGWP_WORKER_TOKENS` | `worker-id:<sha256 hex>[,...]` | required for `static`; digests only |
 | `OGWP_WORKER_AUDIENCE` | audience string | required for `google_oidc` |
+| `OGWP_WORKER_AUTO_ENROLL` | `false` (default), `true` | with `google_oidc`, admit a verified `gpu-worker-<id>@…` account that has no registry row yet and create its row on first heartbeat; enable only when something in front of the coordinator (for example Cloud Run IAM) already decides who may call it |
 | `OGWP_CAPABILITY_PLUGINS` | comma separated, default `deterministic-echo` | the plugins whose schemas this coordinator publishes |
 | `OGWP_PORT` | default `8080` | listen port |
 

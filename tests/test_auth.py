@@ -158,6 +158,63 @@ async def test_google_identity_rejects_an_unenrolled_subject() -> None:
         await authenticator.authenticate("Bearer id-token")
 
 
+async def test_auto_enroll_admits_a_worker_account_by_derived_id() -> None:
+    authenticator = GoogleIdTokenWorkerAuthenticator(
+        audience=AUDIENCE,
+        registry=MemoryWorkerRegistry(),
+        verifier=lambda _token, _audience: {
+            "email": "gpu-worker-rig-01@project.iam.gserviceaccount.com",
+            "email_verified": True,
+        },
+        auto_enroll=True,
+    )
+
+    identity = await authenticator.authenticate("Bearer id-token")
+
+    assert identity.worker_id == "rig-01"
+    assert identity.subject == "gpu-worker-rig-01@project.iam.gserviceaccount.com"
+
+
+async def test_auto_enroll_still_rejects_identities_that_are_not_worker_accounts() -> None:
+    for email in (
+        "stranger@coordinator.invalid",
+        "gpu-worker-@project.iam.gserviceaccount.com",
+        "gpu-worker-Not.Valid@project.iam.gserviceaccount.com",
+    ):
+        authenticator = GoogleIdTokenWorkerAuthenticator(
+            audience=AUDIENCE,
+            registry=MemoryWorkerRegistry(),
+            verifier=lambda _token, _audience, email=email: {
+                "email": email,
+                "email_verified": True,
+            },
+            auto_enroll=True,
+        )
+        with pytest.raises(WorkerAuthError):
+            await authenticator.authenticate("Bearer id-token")
+
+
+async def test_auto_enroll_prefers_an_existing_registry_row() -> None:
+    registry = MemoryWorkerRegistry()
+    await registry.upsert(
+        WorkerRegistration(worker_id="renamed", capabilities=()),
+        identity_subject="gpu-worker-rig-01@project.iam.gserviceaccount.com",
+    )
+    authenticator = GoogleIdTokenWorkerAuthenticator(
+        audience=AUDIENCE,
+        registry=registry,
+        verifier=lambda _token, _audience: {
+            "email": "gpu-worker-rig-01@project.iam.gserviceaccount.com",
+            "email_verified": True,
+        },
+        auto_enroll=True,
+    )
+
+    identity = await authenticator.authenticate("Bearer id-token")
+
+    assert identity.worker_id == "renamed"
+
+
 async def test_a_failing_verifier_is_an_authentication_error() -> None:
     def _explode(_token: str, _audience: str) -> dict[str, object]:
         raise ValueError("token is not signed for this audience")
