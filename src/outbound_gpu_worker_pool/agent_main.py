@@ -9,6 +9,7 @@ heartbeat is sent, and the process exits 0.
 
 import asyncio
 import os
+import shlex
 import signal
 import tempfile
 from collections.abc import Callable, Mapping
@@ -45,18 +46,31 @@ def _comfy_workflow_plugin(environment: Mapping[str, str]) -> GpuExecutorPlugin:
     """
     from outbound_gpu_worker_pool.comfy import (
         DEFAULT_COMFY_BASE_URL,
+        DEFAULT_COMFY_STARTUP_TIMEOUT_SECONDS,
         PACKAGED_TEMPLATES_DIRECTORY,
         ComfyWorkflowPlugin,
         TemplateRegistry,
     )
 
     directory = environment.get("OGWP_COMFY_TEMPLATES_DIR")
+    start_command_raw = environment.get("OGWP_COMFY_START_COMMAND", "")
+    start_command = (
+        tuple(shlex.split(start_command_raw)) if start_command_raw.strip() else None
+    )
+    startup_timeout_seconds = float(
+        environment.get(
+            "OGWP_COMFY_STARTUP_TIMEOUT_SECONDS",
+            DEFAULT_COMFY_STARTUP_TIMEOUT_SECONDS,
+        )
+    )
     return ComfyWorkflowPlugin(
         TemplateRegistry.from_directory(
             Path(directory) if directory else PACKAGED_TEMPLATES_DIRECTORY
         ),
         client=httpx.AsyncClient(timeout=COMFY_TIMEOUT_SECONDS),
         base_url=environment.get("OGWP_COMFY_URL", DEFAULT_COMFY_BASE_URL),
+        start_command=start_command,
+        startup_timeout_seconds=startup_timeout_seconds,
     )
 
 

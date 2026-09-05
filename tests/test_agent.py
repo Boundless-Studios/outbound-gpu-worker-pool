@@ -139,6 +139,22 @@ class _FlakyPlugin(_EchoDelegate):
         return await self.echo.execute(context, request)
 
 
+class _ComfyRuntimeUnavailablePlugin(_EchoDelegate):
+    """Always raises the comfy plugin's runtime-unavailable exception.
+
+    It is not `PluginRequestRejected`, so classification runs through the
+    same generic `except Exception` path a `ConnectError` does — proving
+    `ComfyRuntimeUnavailable` gets the same retryable/released treatment.
+    """
+
+    async def execute(
+        self, context: ExecutionContext, request: ValidatedRequest
+    ) -> PluginOutput:
+        from outbound_gpu_worker_pool.comfy import ComfyRuntimeUnavailable
+
+        raise ComfyRuntimeUnavailable("the local runtime is not reachable")
+
+
 class _RejectingExecutePlugin(_EchoDelegate):
     """Accepts validation and then refuses the request during execution."""
 
@@ -493,6 +509,26 @@ async def test_d_a_plugin_failure_releases_the_job_and_clears_the_workspace(
         assert harness.assets.assets[job.output_key] == (
             _expected_output(job.sources, "job-1", 7)
         )
+
+
+async def test_d_a_comfy_runtime_unavailable_failure_releases_the_job_like_any_other(
+    tmp_path: Path,
+) -> None:
+    """The classification is by exception type: anything not
+    `PluginRequestRejected` — a `ConnectError`, a plain `RuntimeError`, or the
+    comfy plugin's `ComfyRuntimeUnavailable` — is released as retryable.
+    """
+    async with _harness(
+        tmp_path / "workspaces", plugins=(_ComfyRuntimeUnavailablePlugin(),)
+    ) as harness:
+        job = await harness.submit()
+
+        outcome = await harness.agent.run_once()
+
+        assert outcome is AgentOutcome.RELEASED
+        record = harness.jobs.records[job.job_id]
+        assert record.status is JobStatus.QUEUED
+        assert record.leased_by is None
 
 
 async def test_d_a_failed_input_download_releases_the_job(tmp_path: Path) -> None:
