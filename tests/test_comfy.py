@@ -34,7 +34,9 @@ from outbound_gpu_worker_pool.comfy import (
     PACKAGED_TEMPLATES_DIRECTORY,
     ComfyRuntimeUnavailable,
     ComfyWorkflowPlugin,
+    ImageSlot,
     TemplateRegistry,
+    _drop_slot,
     capability_schemas,
     input_schema,
 )
@@ -42,6 +44,7 @@ from outbound_gpu_worker_pool.plugins import ExecutionContext, PluginRequestReje
 
 H3_CAPABILITY = "video.minimax_h3.text_to_video.v1"
 SUBJECT_CAPABILITY = "image.flux2_klein.subject.v1"
+SUBJECT_V2_CAPABILITY = "image.flux2_klein.subject.v2"
 H3_CONDITIONING_NODE = "104"
 H3_SEED_NODE = "15"
 H3_SCHEDULER_NODE = "9"
@@ -376,6 +379,57 @@ def test_the_packaged_directory_ships_the_approved_h3_template() -> None:
             id="malformed-capability-id",
         ),
         pytest.param(_document(graph=[]), "graph", id="graph-is-not-an-object"),
+        pytest.param(
+            _document(
+                image_slots=[
+                    {
+                        "name": "first_frame",
+                        "node_id": "2",
+                        "required": False,
+                        "dependent_node_ids": ["404"],
+                    }
+                ]
+            ),
+            "404",
+            id="slot-dependent-names-an-absent-node",
+        ),
+        pytest.param(
+            {
+                "capability_id": "pool.test.workflow.v1",
+                "contract_version": 1,
+                "template_version": "1",
+                "model_id": "test-model",
+                "model_version": "1",
+                "output_node_id": "3",
+                "output_content_type": "video/mp4",
+                "inputs": [],
+                "image_slots": [
+                    {
+                        "name": "first_frame",
+                        "node_id": "2",
+                        "required": False,
+                        "dependent_node_ids": ["4"],
+                    },
+                    {"name": "second_frame", "node_id": "4", "required": False},
+                ],
+                "graph": {
+                    "2": {
+                        "class_type": "LoadImage",
+                        "inputs": {"image": "placeholder.png"},
+                    },
+                    "4": {
+                        "class_type": "LoadImage",
+                        "inputs": {"image": "placeholder2.png"},
+                    },
+                    "3": {
+                        "class_type": "SaveVideo",
+                        "inputs": {"video": ["2", 0], "filename_prefix": "ogwp/output"},
+                    },
+                },
+            },
+            "dependent",
+            id="slot-dependent-is-another-slots-node",
+        ),
     ],
 )
 def test_an_unusable_template_is_refused_by_file_name(
@@ -436,10 +490,13 @@ def test_the_published_schema_is_the_declared_allowlist() -> None:
 def test_capability_schemas_publish_one_entry_per_template() -> None:
     schemas = capability_schemas(_packaged())
 
-    assert set(schemas) == {H3_CAPABILITY, SUBJECT_CAPABILITY}
+    assert set(schemas) == {H3_CAPABILITY, SUBJECT_CAPABILITY, SUBJECT_V2_CAPABILITY}
     assert schemas[H3_CAPABILITY].contract_version == 1
     assert schemas[H3_CAPABILITY].input_schema["additionalProperties"] is False
     assert schemas[SUBJECT_CAPABILITY].input_schema["required"] == ["prompt"]
+    assert schemas[SUBJECT_V2_CAPABILITY].input_schema["properties"]["images"][
+        "properties"
+    ].keys() == {"ref_1", "ref_2", "ref_3"}
 
 
 async def test_the_manifest_advertises_every_installed_template() -> None:
@@ -448,13 +505,15 @@ async def test_the_manifest_advertises_every_installed_template() -> None:
 
     assert manifest.plugin_id == "comfy-workflow"
     assert manifest.plugin_version == "1"
-    # Templates load in filename order: the subject template sorts before the H3 one.
+    # Templates load in filename order: the subject templates sort before the H3 one.
     assert [capability.capability_id for capability in manifest.capabilities] == [
         SUBJECT_CAPABILITY,
+        SUBJECT_V2_CAPABILITY,
         H3_CAPABILITY,
     ]
     assert [schema.capability_id for schema in manifest.schemas] == [
         SUBJECT_CAPABILITY,
+        SUBJECT_V2_CAPABILITY,
         H3_CAPABILITY,
     ]
 
@@ -636,6 +695,32 @@ async def test_an_unbound_slot_leaves_neither_its_node_nor_a_dangling_link(
     assert H3_FIRST_FRAME_NODE not in graph
     assert "first_frame" not in graph[H3_CONDITIONING_NODE]["inputs"]
     assert fake.uploaded_names == []
+
+
+def test_dropping_a_slot_with_dependents_removes_them_and_their_links_only() -> None:
+    graph: dict[str, JobPayloadValue] = {
+        "2": {"class_type": "LoadImage", "inputs": {"image": "placeholder.png"}},
+        "3": {
+            "class_type": "ImageScaleToTotalPixels",
+            "inputs": {"image": ["2", 0], "megapixels": 1.0},
+        },
+        "4": {"class_type": "VAEEncode", "inputs": {"pixels": ["3", 0], "vae": ["9", 0]}},
+        "5": {
+            "class_type": "ReferenceLatent",
+            "inputs": {"conditioning": ["9", 0], "latent": ["4", 0]},
+        },
+        "9": {"class_type": "CLIPTextEncode", "inputs": {"text": "a cat"}},
+    }
+    slot = ImageSlot(name="ref", node_id="2", dependent_node_ids=("3", "4"))
+
+    _drop_slot(graph, slot)
+
+    assert "2" not in graph
+    assert "3" not in graph
+    assert "4" not in graph
+    # The consumer node survives with its other input untouched.
+    assert "latent" not in graph["5"]["inputs"]
+    assert graph["5"]["inputs"]["conditioning"] == ["9", 0]
 
 
 async def test_a_runtime_execution_error_raises_for_the_agent_to_release(

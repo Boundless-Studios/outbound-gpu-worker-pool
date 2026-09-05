@@ -266,16 +266,21 @@ and the job may only fill the template's declared allowlist:
   lease already granted (`{"images": {"first_frame": "inputs/…/frame.png"}}`); a slot bound to
   a key the coordinator did not grant, and a granted input no slot binds, are both rejected.
   An unbound optional slot is removed from the submitted graph along with the link into it.
+  A slot may also declare `dependent_node_ids`: nodes that only make sense once the slot is
+  bound (a scale/encode chain feeding a downstream node's optional input). Dropping the slot
+  drops those nodes too, so a template author must give the downstream consumer a way to
+  tolerate losing that input.
 
 A template is a `*.template.json` file — `capability_id`, `contract_version`,
 `template_version`, `model_id`, `model_version`, `output_node_id`, `output_content_type`,
 `inputs`, `image_slots`, `graph` — and an operator installs a set of them by pointing
 `OGWP_COMFY_TEMPLATES_DIR` at a directory of them. Every file is validated on load: the
-capability id, that each referenced node exists in the graph, that a slot's node really is a
-`LoadImage`, that every input kind is known, and that no two templates claim one capability.
-A bad file names itself and the worker refuses to start.
+capability id, that each referenced node (including a slot's `dependent_node_ids`) exists in
+the graph, that a slot's node really is a `LoadImage`, that a dependent node is never another
+slot's own node, that every input kind is known, and that no two templates claim one
+capability. A bad file names itself and the worker refuses to start.
 
-Two templates ship in the package and are the default set.
+Three templates ship in the package and are the default set.
 
 `image.flux2_klein.subject.v1`: a single still on the FLUX.2 Klein base 4B (fp8) with the
 `qwen_3_4b` text encoder and `flux2-vae`, contract `1`, output `image/png`, fixed 1024x1024
@@ -287,6 +292,20 @@ backdrop out. It renders in about 20 s on an RTX 4090.
 | `prompt` | string | 1–2000 characters | required |
 | `steps` | integer | 1–40 | 20 |
 | `seed` | integer | ≥ 0 | 0 |
+
+`image.flux2_klein.subject.v2`: the same base model, encoder, VAE, contract, output, and canvas
+as v1, but conditions the render on up to three reference images through `ReferenceLatent`
+instead of text alone — a subject that has to look like specific people or objects, not just
+match a description. Each reference is optional and independent; any subset may be bound.
+
+| Input | Kind | Range | Default |
+|---|---|---|---|
+| `prompt` | string | 1–2000 characters | required |
+| `steps` | integer | 1–40 | 20 |
+| `seed` | integer | ≥ 0 | 0 |
+| `images.ref_1` | asset key | a granted input key | optional |
+| `images.ref_2` | asset key | a granted input key | optional |
+| `images.ref_3` | asset key | a granted input key | optional |
 
 `video.minimax_h3.text_to_video.v1`, model `minimax-h3` / `fl2va-int8`, contract `1`, output
 `video/mp4`.

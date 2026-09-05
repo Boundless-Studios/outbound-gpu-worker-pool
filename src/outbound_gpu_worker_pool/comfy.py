@@ -94,11 +94,19 @@ class TemplateInput:
 
 @dataclass(frozen=True)
 class ImageSlot:
-    """A `LoadImage` node a job may bind one granted input asset to."""
+    """A `LoadImage` node a job may bind one granted input asset to.
+
+    `dependent_node_ids` names the nodes that only make sense once this slot is
+    bound (a scale/encode chain feeding a downstream node's optional input).
+    Dropping the slot drops these too, so the downstream consumer must tolerate
+    losing that input — e.g. a `ReferenceLatent` whose `latent` input is optional
+    and simply passes `conditioning` through unchanged when absent.
+    """
 
     name: str
     node_id: str
     required: bool = False
+    dependent_node_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -513,6 +521,7 @@ def _template_from_document(document: dict[str, JobPayloadValue]) -> ComfyTempla
                 name=entry["name"],
                 node_id=entry["node_id"],
                 required=entry.get("required", False),
+                dependent_node_ids=tuple(entry.get("dependent_node_ids", ())),
             )
             for entry in document["image_slots"]
         ),
@@ -541,6 +550,7 @@ def _validate_template(template: ComfyTemplate) -> None:
             raise ValueError(
                 f"input {entry.name} declares an unknown kind: {entry.kind}"
             )
+    slot_node_ids = {slot.node_id for slot in template.image_slots}
     for slot in template.image_slots:
         node = template.graph[slot.node_id]
         assert isinstance(node, dict)
@@ -548,6 +558,17 @@ def _validate_template(template: ComfyTemplate) -> None:
             raise ValueError(
                 f"image slot {slot.name} must bind a {LOAD_IMAGE_CLASS_TYPE} node"
             )
+        for dependent_id in slot.dependent_node_ids:
+            if not isinstance(template.graph.get(dependent_id), dict):
+                raise ValueError(
+                    f"image slot {slot.name} names a dependent node the graph "
+                    f"does not declare: {dependent_id}"
+                )
+            if dependent_id in slot_node_ids:
+                raise ValueError(
+                    f"image slot {slot.name} names another slot's node as a "
+                    f"dependent: {dependent_id}"
+                )
     if not isinstance(template.graph.get(template.output_node_id), dict):
         raise ValueError(
             "output_node_id names a node the graph does not declare: "
@@ -615,14 +636,21 @@ def _node_inputs(
 
 
 def _drop_slot(graph: dict[str, JobPayloadValue], slot: ImageSlot) -> None:
-    """An unbound slot leaves neither its node nor a link into it."""
-    graph.pop(slot.node_id, None)
+    """An unbound slot leaves neither its node, its dependents, nor a link into any of them.
+
+    A consumer downstream of a dependent node must tolerate losing that input —
+    e.g. `ReferenceLatent`'s optional `latent` input, which the node passes its
+    `conditioning` through unchanged without.
+    """
+    removed_node_ids = {slot.node_id, *slot.dependent_node_ids}
+    for node_id in removed_node_ids:
+        graph.pop(node_id, None)
     for node_id in graph:
         inputs = _node_inputs(graph, node_id)
         for name in [
             name
             for name, value in inputs.items()
-            if _links_to(value, slot.node_id)
+            if any(_links_to(value, removed_id) for removed_id in removed_node_ids)
         ]:
             del inputs[name]
 
