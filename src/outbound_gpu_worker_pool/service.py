@@ -19,6 +19,8 @@ from datetime import UTC, datetime, timedelta
 
 from outbound_gpu_worker_pool.contracts import (
     MAX_AUDIT_REASON_LENGTH,
+    POOL_WORKER_ONLINE_WINDOW_SECONDS,
+    POOL_WORKER_VISIBILITY_WINDOW_SECONDS,
     PUBLICATION_MODE_IMMUTABLE_CREATE_ONCE,
     AssetGrant,
     AssetStore,
@@ -35,6 +37,9 @@ from outbound_gpu_worker_pool.contracts import (
     JobSubmission,
     LeaseGrant,
     OutputManifest,
+    PoolWorkerStatus,
+    PoolWorkerView,
+    QueueDepth,
     WorkerAuthenticator,
     WorkerAuthError,
     WorkerIdentity,
@@ -176,6 +181,51 @@ class WorkerPoolService:
 
     async def list_workers(self) -> tuple[WorkerRecord, ...]:
         return await self._registry.list()
+
+    async def worker_views(
+        self,
+        *,
+        online_window_seconds: int = POOL_WORKER_ONLINE_WINDOW_SECONDS,
+        visibility_window_seconds: int = POOL_WORKER_VISIBILITY_WINDOW_SECONDS,
+    ) -> tuple[PoolWorkerView, ...]:
+        """The rows for a host's `GET /pool/workers`.
+
+        A worker never heard from, or not heard from in `visibility_window_seconds`
+        (default 24h), is omitted entirely rather than reported offline.
+        """
+        now = self._clock()
+        views: list[PoolWorkerView] = []
+        for record in await self._registry.list():
+            if record.last_heartbeat_at is None:
+                continue
+            age_seconds = (now - record.last_heartbeat_at).total_seconds()
+            if age_seconds > visibility_window_seconds:
+                continue
+            draining = record.status is WorkerStatus.DRAINING
+            if record.busy_job_id is not None:
+                status = PoolWorkerStatus.BUSY
+            elif draining:
+                status = PoolWorkerStatus.DRAINING
+            elif age_seconds <= online_window_seconds:
+                status = PoolWorkerStatus.ONLINE
+            else:
+                status = PoolWorkerStatus.OFFLINE
+            views.append(
+                PoolWorkerView(
+                    worker_id=record.worker_id,
+                    status=status,
+                    last_heartbeat_at=record.last_heartbeat_at,
+                    capability_ids=record.capability_ids,
+                    gpus=record.gpus,
+                    busy_job_id=record.busy_job_id,
+                    draining=draining,
+                )
+            )
+        return tuple(views)
+
+    async def queue_depth(self) -> QueueDepth:
+        """Bounded queue depth for a host's `GET /pool/queue`."""
+        return await self._jobs.queue_depth()
 
     async def audit_for_job(self, job_id: str) -> tuple[AuditEvent, ...]:
         return await self._audit.list_for_job(job_id)

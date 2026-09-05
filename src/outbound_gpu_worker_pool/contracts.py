@@ -37,6 +37,10 @@ MAX_EXECUTION_DEADLINE_SECONDS = 7_200
 MAX_CAPABILITY_ID_LENGTH = 128
 MAX_WORKER_ID_LENGTH = 128
 MAX_AUDIT_REASON_LENGTH = 300
+MAX_WORKER_GPUS = 16
+MAX_GPU_NAME_LENGTH = 128
+POOL_WORKER_ONLINE_WINDOW_SECONDS = 90
+POOL_WORKER_VISIBILITY_WINDOW_SECONDS = 24 * 60 * 60
 
 PUBLICATION_MODE_IMMUTABLE_CREATE_ONCE = "immutable_create_once"
 DETERMINISTIC_ECHO_CAPABILITY = "test.deterministic.echo.v1"
@@ -218,6 +222,14 @@ class JobStore(Protocol):
         """Fail processing jobs whose lease expired past their attempt budget."""
         ...
 
+    async def queue_depth(self) -> "QueueDepth":
+        """Bounded queued/processing counts, overall and per capability.
+
+        Implementations aggregate in the store (a `GROUP BY`, not a full scan
+        loaded into memory) so this stays cheap regardless of queue size.
+        """
+        ...
+
 
 class WorkerStatus(StrEnum):
     ACTIVE = "active"
@@ -255,6 +267,21 @@ class WorkerCapability:
 
 
 @dataclass(frozen=True)
+class GpuTelemetry:
+    """One GPU's live utilization and memory as a worker samples it.
+
+    Any field a sampler could not read (for example `nvidia-smi` reporting
+    `[N/A]`) is `None`; the whole tuple is empty when sampling itself failed.
+    """
+
+    index: int
+    name: str
+    utilization_pct: int | None
+    memory_used_mb: int | None
+    memory_total_mb: int | None
+
+
+@dataclass(frozen=True)
 class WorkerRegistration:
     """What an agent advertises on every heartbeat."""
 
@@ -267,6 +294,8 @@ class WorkerRegistration:
     labels: tuple[str, ...] = ()
     active_leases: int = 0
     draining: bool = False
+    gpus: tuple[GpuTelemetry, ...] = ()
+    busy_job_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -287,10 +316,54 @@ class WorkerRecord:
     created_at: datetime
     updated_at: datetime
     revoked_at: datetime | None = None
+    gpus: tuple[GpuTelemetry, ...] = ()
+    busy_job_id: str | None = None
 
     @property
     def capability_ids(self) -> tuple[str, ...]:
         return tuple(capability.capability_id for capability in self.capabilities)
+
+
+class PoolWorkerStatus(StrEnum):
+    """The presentation status a host-facing pool status route reports.
+
+    Distinct from `WorkerStatus`, which is the registry's own active / draining
+    / revoked lifecycle: this is derived per request from a worker's current
+    lease and heartbeat recency, for `GET /pool/workers`.
+    """
+
+    BUSY = "busy"
+    DRAINING = "draining"
+    ONLINE = "online"
+    OFFLINE = "offline"
+
+
+@dataclass(frozen=True)
+class PoolWorkerView:
+    """One row of `GET /pool/workers`: a worker's derived status plus telemetry."""
+
+    worker_id: str
+    status: PoolWorkerStatus
+    last_heartbeat_at: datetime | None
+    capability_ids: tuple[str, ...]
+    gpus: tuple[GpuTelemetry, ...]
+    busy_job_id: str | None
+    draining: bool
+
+
+@dataclass(frozen=True)
+class CapabilityQueueDepth:
+    queued: int
+    processing: int
+
+
+@dataclass(frozen=True)
+class QueueDepth:
+    """The result of `GET /pool/queue`: bounded counts, never a job listing."""
+
+    queued: int
+    processing: int
+    by_capability: dict[str, CapabilityQueueDepth]
 
 
 @dataclass(frozen=True)

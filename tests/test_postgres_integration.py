@@ -20,6 +20,7 @@ import pytest
 from outbound_gpu_worker_pool import (
     DETERMINISTIC_ECHO_CAPABILITY,
     AuditEventType,
+    GpuTelemetry,
     IdempotencyConflict,
     IdentitySubjectTaken,
     JobFailureCode,
@@ -567,3 +568,75 @@ async def test_one_identity_subject_enrolls_exactly_one_worker(
             replace(registration, worker_id="worker-b"),
             identity_subject="worker@pool.invalid",
         )
+
+
+async def test_worker_gpus_and_busy_job_id_round_trip(
+    pool_fixture: PoolFixture,
+) -> None:
+    job_id = await _submit(pool_fixture, "busy-job")
+    gpus = (
+        GpuTelemetry(
+            index=0,
+            name="NVIDIA GeForce RTX 4090",
+            utilization_pct=37,
+            memory_used_mb=1024,
+            memory_total_mb=24576,
+        ),
+        GpuTelemetry(
+            index=1,
+            name="NVIDIA GeForce RTX 4090",
+            utilization_pct=None,
+            memory_used_mb=None,
+            memory_total_mb=24576,
+        ),
+    )
+    registration = WorkerRegistration(
+        worker_id="worker-a",
+        capabilities=(
+            WorkerCapability(
+                capability_id=ECHO, plugin_id="deterministic-echo", plugin_version="1"
+            ),
+        ),
+        gpus=gpus,
+        busy_job_id=job_id,
+    )
+
+    created = await pool_fixture.registry.upsert(
+        registration, identity_subject="static:worker-a"
+    )
+    assert created.gpus == gpus
+    assert created.busy_job_id == job_id
+
+    fetched = await pool_fixture.registry.get("worker-a")
+    assert fetched is not None
+    assert fetched.gpus == gpus
+    assert fetched.busy_job_id == job_id
+
+    # A subsequent heartbeat with no GPUs and no busy job clears both.
+    idle = await pool_fixture.registry.upsert(
+        replace(registration, gpus=(), busy_job_id=None),
+        identity_subject="static:worker-a",
+    )
+    assert idle.gpus == ()
+    assert idle.busy_job_id is None
+
+
+async def test_queue_depth_counts_by_capability_and_status(
+    pool_fixture: PoolFixture,
+) -> None:
+    await _submit(pool_fixture, "echo-queued-1")
+    await _submit(pool_fixture, "echo-queued-2")
+    await _submit(pool_fixture, "other-queued-1", capability_id=OTHER)
+    completed_job_id = await _submit(pool_fixture, "echo-completed")
+    async with pool_fixture.pool.acquire() as connection:
+        await connection.execute(
+            f"UPDATE {POOL_JOBS_TABLE} SET status = 'completed' WHERE job_id = $1::uuid",
+            completed_job_id,
+        )
+
+    depth = await pool_fixture.jobs.queue_depth()
+
+    assert depth.queued == 3
+    assert depth.processing == 0
+    assert depth.by_capability[ECHO].queued == 2
+    assert depth.by_capability[OTHER].queued == 1

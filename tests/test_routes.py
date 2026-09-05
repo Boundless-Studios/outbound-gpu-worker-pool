@@ -673,7 +673,10 @@ def test_the_capability_schema_describes_the_injected_capability() -> None:
             },
         ),
         ("/worker/v1/lease", {"capability_ids": [ECHO], "unexpected": 1}),
-        ("/worker/v1/jobs/{job_id}/heartbeat", {"claim_token": "token", "unexpected": 1}),
+        (
+            "/worker/v1/jobs/{job_id}/heartbeat",
+            {"claim_token": "token", "unexpected": 1},
+        ),
         (
             "/worker/v1/jobs/{job_id}/complete",
             {
@@ -732,6 +735,7 @@ def test_every_request_dto_is_closed_and_string_bounded() -> None:
 
     assert {model.__name__ for model in models} == {
         "WorkerCapabilityDto",
+        "GpuTelemetryDto",
         "WorkerHeartbeatRequest",
         "LeaseRequest",
         "JobHeartbeatRequest",
