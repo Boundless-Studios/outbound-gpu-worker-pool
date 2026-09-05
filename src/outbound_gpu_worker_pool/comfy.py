@@ -15,6 +15,8 @@ import asyncio
 import copy
 import ipaddress
 import json
+import logging
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -44,6 +46,9 @@ COMFY_WORKFLOW_PLUGIN_VERSION = "1"
 DEFAULT_COMFY_BASE_URL = "http://127.0.0.1:8188"
 DEFAULT_COMFY_CLIENT_ID = "outbound-gpu-worker-pool"
 DEFAULT_POLL_INTERVAL_SECONDS = 5.0
+DEFAULT_COMFY_STARTUP_TIMEOUT_SECONDS = 180.0
+STARTUP_COMMAND_TIMEOUT_SECONDS = 30.0
+MAX_STARTUP_STDERR_LENGTH = 500
 PACKAGED_TEMPLATES_DIRECTORY = Path(__file__).resolve().parent / "templates"
 TEMPLATE_SUFFIX = ".template.json"
 LOAD_IMAGE_CLASS_TYPE = "LoadImage"
@@ -60,6 +65,12 @@ PROGRESS_RUNNING = 50
 PROGRESS_COMPLETE = 100
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 SHARED_ADDRESS_SPACE = ipaddress.ip_network("100.64.0.0/10")
+
+logger = logging.getLogger(__name__)
+
+
+class ComfyRuntimeUnavailable(Exception):
+    """The local ComfyUI runtime could not be confirmed up or brought up."""
 
 
 @dataclass(frozen=True)
@@ -199,6 +210,9 @@ class ComfyWorkflowPlugin:
         base_url: str = DEFAULT_COMFY_BASE_URL,
         poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
         client_id: str = DEFAULT_COMFY_CLIENT_ID,
+        start_command: tuple[str, ...] | None = None,
+        startup_timeout_seconds: float = DEFAULT_COMFY_STARTUP_TIMEOUT_SECONDS,
+        startup_poll_interval_seconds: float = 2.0,
     ) -> None:
         _require_private_runtime(base_url)
         self._registry = registry
@@ -206,6 +220,9 @@ class ComfyWorkflowPlugin:
         self._base_url = base_url.rstrip("/")
         self._poll_interval_seconds = poll_interval_seconds
         self._client_id = client_id
+        self._start_command = start_command
+        self._startup_timeout_seconds = startup_timeout_seconds
+        self._startup_poll_interval_seconds = startup_poll_interval_seconds
         self._prompts: dict[str, str] = {}
 
     def capabilities(self) -> CapabilityManifest:
@@ -250,9 +267,69 @@ class ComfyWorkflowPlugin:
             seed=seed if isinstance(seed, int) else None,
         )
 
+    async def ensure_running(self) -> None:
+        """Confirm the local runtime is up, starting it if the operator allows.
+
+        A shared GPU box may run a helper that stops an idle ComfyUI to free the
+        GPU for another product. The pool owns bringing it back up before it
+        submits work, rather than assuming another process already did.
+        """
+        if await self._probe_up():
+            return
+        if self._start_command is None:
+            raise ComfyRuntimeUnavailable(
+                "the local runtime is not reachable and no start command is configured"
+            )
+        start = time.monotonic()
+        await self._run_start_command()
+        deadline = start + self._startup_timeout_seconds
+        while time.monotonic() < deadline:
+            if await self._probe_up():
+                logger.info(
+                    "the agent started the local ComfyUI runtime",
+                    extra={"seconds": round(time.monotonic() - start, 3)},
+                )
+                return
+            await asyncio.sleep(self._startup_poll_interval_seconds)
+        raise ComfyRuntimeUnavailable(
+            "the local runtime did not become reachable within "
+            f"{self._startup_timeout_seconds}s"
+        )
+
+    async def _probe_up(self) -> bool:
+        try:
+            response = await self._client.get(self._route("/system_stats"))
+        except httpx.TransportError:
+            return False
+        return response.status_code == httpx.codes.OK
+
+    async def _run_start_command(self) -> None:
+        assert self._start_command is not None
+        process = await asyncio.create_subprocess_exec(
+            *self._start_command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            _, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=STARTUP_COMMAND_TIMEOUT_SECONDS
+            )
+        except TimeoutError:
+            process.kill()
+            await process.wait()
+            logger.warning("the ComfyUI start command timed out")
+            return
+        if process.returncode != 0:
+            logger.warning(
+                "the ComfyUI start command exited with status %s: %s",
+                process.returncode,
+                stderr[-MAX_STARTUP_STDERR_LENGTH:].decode(errors="replace"),
+            )
+
     async def execute(
         self, context: ExecutionContext, request: ValidatedRequest
     ) -> PluginOutput:
+        await self.ensure_running()
         template = self._registry.template(request.capability_id)
         if template is None:
             raise PluginRequestRejected("unsupported capability")

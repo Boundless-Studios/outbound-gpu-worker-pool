@@ -10,6 +10,7 @@ ComfyUI built on `httpx.MockTransport`. The end-to-end case runs the real
 import asyncio
 import json
 import re
+import sys
 from collections.abc import AsyncIterator, Callable, Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -19,6 +20,7 @@ from uuid import uuid4
 
 import httpx
 import pytest
+from test_agent import _harness
 
 from outbound_gpu_worker_pool import (
     AssetGrant,
@@ -30,13 +32,13 @@ from outbound_gpu_worker_pool import (
 from outbound_gpu_worker_pool.agent import AgentOutcome
 from outbound_gpu_worker_pool.comfy import (
     PACKAGED_TEMPLATES_DIRECTORY,
+    ComfyRuntimeUnavailable,
     ComfyWorkflowPlugin,
     TemplateRegistry,
     capability_schemas,
     input_schema,
 )
 from outbound_gpu_worker_pool.plugins import ExecutionContext, PluginRequestRejected
-from test_agent import _harness
 
 H3_CAPABILITY = "video.minimax_h3.text_to_video.v1"
 H3_CONDITIONING_NODE = "104"
@@ -167,12 +169,26 @@ class _FakeComfy:
     stats_status: int = httpx.codes.OK
     stored_as: str = "stored-frame.png"
     on_prompt: Callable[[], None] | None = None
+    # Ordered outcomes for successive `/system_stats` probes; each entry is
+    # either an int status or the string "error" for a transport failure.
+    # Once exhausted, further probes fall back to `stats_status`.
+    stats_probe_outcomes: list[int | str] = field(default_factory=list)
+    stats_probe_calls: int = 0
 
     def transport(self) -> httpx.MockTransport:
         return httpx.MockTransport(self.handle)
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
+        if path == "/system_stats" and self.stats_probe_outcomes:
+            index = self.stats_probe_calls
+            self.stats_probe_calls += 1
+            outcome = self.stats_probe_outcomes[
+                min(index, len(self.stats_probe_outcomes) - 1)
+            ]
+            if outcome == "error":
+                raise httpx.ConnectError("boom")
+            return httpx.Response(outcome, json={})
         if path == "/upload/image":
             match = UPLOAD_FILENAME.search(request.content)
             assert match is not None
@@ -200,13 +216,21 @@ class _FakeComfy:
 
 @asynccontextmanager
 async def _comfy(
-    fake: _FakeComfy, registry: TemplateRegistry | None = None
+    fake: _FakeComfy,
+    registry: TemplateRegistry | None = None,
+    *,
+    start_command: tuple[str, ...] | None = None,
+    startup_timeout_seconds: float = 180.0,
+    startup_poll_interval_seconds: float = 2.0,
 ) -> AsyncIterator[ComfyWorkflowPlugin]:
     async with httpx.AsyncClient(transport=fake.transport()) as client:
         yield ComfyWorkflowPlugin(
             registry if registry is not None else _packaged(),
             client=client,
             poll_interval_seconds=0.0,
+            start_command=start_command,
+            startup_timeout_seconds=startup_timeout_seconds,
+            startup_poll_interval_seconds=startup_poll_interval_seconds,
         )
 
 
@@ -695,6 +719,108 @@ async def test_health_reports_the_local_runtime(status: int, healthy: bool) -> N
     assert health.healthy is healthy
     if not healthy:
         assert str(status) in health.detail
+
+
+# --- runtime supervision -----------------------------------------------------
+
+
+async def test_ensure_running_returns_immediately_when_up(tmp_path: Path) -> None:
+    fake = _FakeComfy(stats_status=httpx.codes.OK)
+    marker = tmp_path / "started"
+    # A start command that would prove itself if it ever ran.
+    start_command = (sys.executable, "-c", f"open({str(marker)!r}, 'w').close()")
+
+    async with _comfy(fake, start_command=start_command) as plugin:
+        await plugin.ensure_running()
+
+    assert not marker.exists()
+
+
+async def test_ensure_running_raises_when_down_and_no_start_command() -> None:
+    fake = _FakeComfy(stats_probe_outcomes=["error"])
+
+    async with _comfy(fake, start_command=None) as plugin:
+        with pytest.raises(ComfyRuntimeUnavailable):
+            await plugin.ensure_running()
+
+    assert fake.stats_probe_calls == 1
+
+
+async def test_ensure_running_starts_the_runtime_and_waits_for_health(
+    tmp_path: Path,
+) -> None:
+    # Down, down, then up: the poll after the start command succeeds.
+    fake = _FakeComfy(
+        stats_probe_outcomes=[httpx.codes.SERVICE_UNAVAILABLE] * 2 + [httpx.codes.OK]
+    )
+    marker = tmp_path / "started"
+    start_command = (sys.executable, "-c", f"open({str(marker)!r}, 'w').close()")
+
+    async with _comfy(
+        fake,
+        start_command=start_command,
+        startup_timeout_seconds=5.0,
+        startup_poll_interval_seconds=0.01,
+    ) as plugin:
+        await plugin.ensure_running()
+
+    assert marker.exists()
+    assert fake.stats_probe_calls == 3
+
+
+async def test_ensure_running_times_out_when_the_runtime_never_recovers(
+    tmp_path: Path,
+) -> None:
+    fake = _FakeComfy(stats_probe_outcomes=[httpx.codes.SERVICE_UNAVAILABLE])
+    marker = tmp_path / "started"
+    start_command = (sys.executable, "-c", f"open({str(marker)!r}, 'w').close()")
+
+    async with _comfy(
+        fake,
+        start_command=start_command,
+        startup_timeout_seconds=0.05,
+        startup_poll_interval_seconds=0.01,
+    ) as plugin:
+        with pytest.raises(ComfyRuntimeUnavailable):
+            await plugin.ensure_running()
+
+    assert marker.exists()
+
+
+async def test_ensure_running_survives_a_nonzero_start_command_exit(
+    tmp_path: Path,
+) -> None:
+    fake = _FakeComfy(
+        stats_probe_outcomes=[httpx.codes.SERVICE_UNAVAILABLE, httpx.codes.OK]
+    )
+    start_command = (sys.executable, "-c", "import sys; sys.exit(1)")
+
+    async with _comfy(
+        fake,
+        start_command=start_command,
+        startup_timeout_seconds=5.0,
+        startup_poll_interval_seconds=0.01,
+    ) as plugin:
+        # A non-zero exit (e.g. `systemctl --user start` on an already-activating
+        # unit) does not abort the wait for health.
+        await plugin.ensure_running()
+
+    assert fake.stats_probe_calls == 2
+
+
+async def test_execute_ensures_the_runtime_is_running_before_submitting(
+    tmp_path: Path,
+) -> None:
+    fake = _FakeComfy(stats_probe_outcomes=["error"])
+    run = _run(tmp_path)
+
+    async with _comfy(fake, start_command=None) as plugin:
+        request = plugin.validate(_lease({"prompt": PROMPT_TEXT}))
+        with pytest.raises(ComfyRuntimeUnavailable):
+            await plugin.execute(run.context, request)
+
+    assert fake.graphs == []
+    assert fake.uploaded_names == []
 
 
 # --- the runtime address ----------------------------------------------------

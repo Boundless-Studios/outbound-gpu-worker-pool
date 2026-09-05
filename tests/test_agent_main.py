@@ -46,6 +46,34 @@ def test_a_the_comfy_plugin_is_built_from_the_packaged_templates() -> None:
     assert agent.capability_ids == ("video.minimax_h3.text_to_video.v1",)
 
 
+def test_the_comfy_start_command_is_split_from_the_environment() -> None:
+    plugin = agent_main._comfy_workflow_plugin(
+        {"OGWP_COMFY_START_COMMAND": "systemctl --user start comfyui"}
+    )
+
+    assert plugin._start_command == ("systemctl", "--user", "start", "comfyui")
+
+
+def test_the_comfy_start_command_is_none_when_unset_or_empty() -> None:
+    unset = agent_main._comfy_workflow_plugin({})
+    empty = agent_main._comfy_workflow_plugin({"OGWP_COMFY_START_COMMAND": ""})
+
+    assert unset._start_command is None
+    assert empty._start_command is None
+
+
+def test_the_comfy_startup_timeout_is_configurable_from_the_environment() -> None:
+    from outbound_gpu_worker_pool.comfy import DEFAULT_COMFY_STARTUP_TIMEOUT_SECONDS
+
+    default = agent_main._comfy_workflow_plugin({})
+    configured = agent_main._comfy_workflow_plugin(
+        {"OGWP_COMFY_STARTUP_TIMEOUT_SECONDS": "30"}
+    )
+
+    assert default._startup_timeout_seconds == DEFAULT_COMFY_STARTUP_TIMEOUT_SECONDS
+    assert configured._startup_timeout_seconds == 30.0
+
+
 @pytest.mark.parametrize(
     "environment",
     [

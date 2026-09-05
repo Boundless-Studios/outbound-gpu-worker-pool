@@ -309,10 +309,19 @@ python -m outbound_gpu_worker_pool.agent_main
 |---|---|---|
 | `OGWP_COMFY_URL` | default `http://127.0.0.1:8188` | the local ComfyUI; loopback or private only |
 | `OGWP_COMFY_TEMPLATES_DIR` | path, default the packaged templates | the workflow templates this machine is approved to run |
+| `OGWP_COMFY_START_COMMAND` | shell-split command, default unset | how to start the local runtime when it is down; unset means the agent fails the job instead |
+| `OGWP_COMFY_STARTUP_TIMEOUT_SECONDS` | seconds, default `180` | how long to wait for the runtime to answer healthy after starting it |
 
 A coordinator publishes the same templates' schemas with
 `OGWP_CAPABILITY_PLUGINS=comfy-workflow`. It reads the packaged template directory for the
 schemas only and never opens a connection to any runtime.
+
+**The agent owns ComfyUI's availability, not the other way round.** Before every job it
+probes `/system_stats`; if the runtime is down it runs `OGWP_COMFY_START_COMMAND` and waits
+for health before submitting. This matters on a shared GPU machine, where another product's
+helper may stop an idle ComfyUI to free the GPU: set `OGWP_COMFY_START_COMMAND` there (for
+example `systemctl --user start comfyui`) so the pool brings the runtime back up itself
+instead of failing every job with a connection error.
 
 ## Failure semantics
 

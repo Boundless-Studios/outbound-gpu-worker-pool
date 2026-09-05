@@ -130,6 +130,14 @@ if [ ! -f "$ENVIRONMENT_FILE" ]; then
 # The approved workflow templates this machine may run. Left unset, the packaged
 # template directory inside the venv is used instead of your curated copy.
 #OGWP_COMFY_TEMPLATES_DIR=$TEMPLATES
+
+# How to start the local runtime when it is found down before a job. Set this
+# on a shared GPU box where another process may stop an idle ComfyUI to free
+# the GPU; left unset, the agent fails the job instead of starting anything.
+#OGWP_COMFY_START_COMMAND=systemctl --user start comfyui
+
+# How long to wait for the runtime to answer healthy after starting it.
+#OGWP_COMFY_STARTUP_TIMEOUT_SECONDS=180
 ENVIRONMENT
     )
     chmod 600 "$ENVIRONMENT_FILE"
