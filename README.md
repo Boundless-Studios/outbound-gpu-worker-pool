@@ -275,8 +275,21 @@ capability id, that each referenced node exists in the graph, that a slot's node
 `LoadImage`, that every input kind is known, and that no two templates claim one capability.
 A bad file names itself and the worker refuses to start.
 
-One template ships in the package and is the default: `video.minimax_h3.text_to_video.v1`,
-model `minimax-h3` / `fl2va-int8`, contract `1`, output `video/mp4`.
+Two templates ship in the package and are the default set.
+
+`image.flux2_klein.subject.v1`: a single still on the FLUX.2 Klein base 4B (fp8) with the
+`qwen_3_4b` text encoder and `flux2-vae`, contract `1`, output `image/png`, fixed 1024x1024
+canvas. Built for character subjects on a chroma-key green screen; the consumer keys the
+backdrop out. It renders in about 20 s on an RTX 4090.
+
+| Input | Kind | Range | Default |
+|---|---|---|---|
+| `prompt` | string | 1–2000 characters | required |
+| `steps` | integer | 1–40 | 20 |
+| `seed` | integer | ≥ 0 | 0 |
+
+`video.minimax_h3.text_to_video.v1`, model `minimax-h3` / `fl2va-int8`, contract `1`, output
+`video/mp4`.
 
 | Input | Kind | Range | Default |
 |---|---|---|---|
