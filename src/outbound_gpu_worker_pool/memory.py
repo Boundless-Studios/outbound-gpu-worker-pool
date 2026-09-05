@@ -20,6 +20,7 @@ from outbound_gpu_worker_pool.contracts import (
     AssetTooLarge,
     AuditEvent,
     AuditEventType,
+    CapabilityQueueDepth,
     IdempotencyConflict,
     IdentitySubjectTaken,
     JobFailureCode,
@@ -27,6 +28,7 @@ from outbound_gpu_worker_pool.contracts import (
     JobRecord,
     JobStatus,
     JobSubmission,
+    QueueDepth,
     SubmissionResult,
     WorkerAuthError,
     WorkerIdentity,
@@ -233,6 +235,27 @@ class MemoryJobStore:
             expired += 1
         return expired
 
+    async def queue_depth(self) -> QueueDepth:
+        totals = {"queued": 0, "processing": 0}
+        by_capability: dict[str, dict[str, int]] = {}
+        for record in self.records.values():
+            if record.status not in (JobStatus.QUEUED, JobStatus.PROCESSING):
+                continue
+            key = "queued" if record.status is JobStatus.QUEUED else "processing"
+            totals[key] += 1
+            counts = by_capability.setdefault(
+                record.capability_id, {"queued": 0, "processing": 0}
+            )
+            counts[key] += 1
+        return QueueDepth(
+            queued=totals["queued"],
+            processing=totals["processing"],
+            by_capability={
+                capability_id: CapabilityQueueDepth(**counts)
+                for capability_id, counts in by_capability.items()
+            },
+        )
+
     def _leased(self, job_id: str, claim_token: str) -> JobRecord | None:
         record = self.records.get(job_id)
         if (
@@ -357,6 +380,8 @@ class MemoryWorkerRegistry:
             created_at=existing.created_at if existing is not None else now,
             updated_at=now,
             revoked_at=existing.revoked_at if existing is not None else None,
+            gpus=registration.gpus,
+            busy_job_id=registration.busy_job_id,
         )
         self.workers[record.worker_id] = record
         return record

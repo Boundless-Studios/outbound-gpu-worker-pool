@@ -42,7 +42,9 @@ from outbound_gpu_worker_pool.agent import (
     TransferError,
     WorkerAgent,
 )
+from outbound_gpu_worker_pool.contracts import GpuTelemetry
 from outbound_gpu_worker_pool.coordinator import create_coordinator_app
+from outbound_gpu_worker_pool.gpu_sampler import GpuSampler
 from outbound_gpu_worker_pool.memory import MemoryAssetTransfer
 from outbound_gpu_worker_pool.plugins import (
     CapabilityManifest,
@@ -306,6 +308,13 @@ class _Harness:
         ]
 
 
+class _NoGpuSampler:
+    """The harness default: no GPU, and no warning noise in unrelated tests."""
+
+    def sample(self) -> tuple[GpuTelemetry, ...]:
+        return ()
+
+
 @asynccontextmanager
 async def _harness(
     workspace_root: Path,
@@ -315,7 +324,9 @@ async def _harness(
         MemoryAssetTransfer
     ),
     max_input_bytes: int = DEFAULT_MAX_INPUT_BYTES,
+    gpu_sampler: GpuSampler | None = None,
 ) -> AsyncIterator[_Harness]:
+    active_gpu_sampler = gpu_sampler if gpu_sampler is not None else _NoGpuSampler()
     jobs = MemoryJobStore()
     assets = MemoryAssetStore()
     registry = MemoryWorkerRegistry()
@@ -365,6 +376,7 @@ async def _harness(
                 max_poll_seconds=0.04,
                 random=lambda: 1.0,
                 sleep=sleep,
+                gpu_sampler=active_gpu_sampler,
             ),
             workspace_root=workspace_root,
         )
@@ -403,7 +415,8 @@ async def test_a_several_inputs_are_hashed_in_key_order(tmp_path: Path) -> None:
         assert await harness.agent.run_once() is AgentOutcome.COMPLETED
 
         ordered = [
-            source for _, source in sorted(zip(job.input_keys, job.sources, strict=True))
+            source
+            for _, source in sorted(zip(job.input_keys, job.sources, strict=True))
         ]
         assert harness.assets.assets[job.output_key] == (
             _expected_output(ordered, "job-1", 7)
@@ -659,6 +672,7 @@ async def test_the_poll_loop_survives_a_coordinator_transport_error(
             min_poll_seconds=0.01,
             random=lambda: 1.0,
             sleep=sleep,
+            gpu_sampler=_NoGpuSampler(),  # type: ignore[arg-type]
         )
 
         await agent.run_forever(stop)
@@ -773,3 +787,97 @@ async def test_h_a_download_stops_before_it_passes_the_byte_bound(
     # small scratch disk cannot be filled by one oversized input.
     assert destination.stat().st_size <= 16
     assert "storage.invalid" not in str(error.value)
+
+
+class _StaticGpuSampler:
+    """A GpuSampler stand-in that always returns the same fixed telemetry."""
+
+    def __init__(self, telemetry: tuple[GpuTelemetry, ...]) -> None:
+        self._telemetry = telemetry
+
+    def sample(self) -> tuple[GpuTelemetry, ...]:
+        return self._telemetry
+
+
+GPU_TELEMETRY = (
+    GpuTelemetry(
+        index=0,
+        name="NVIDIA GeForce RTX 4090",
+        utilization_pct=37,
+        memory_used_mb=1024,
+        memory_total_mb=24576,
+    ),
+)
+
+
+async def test_a_heartbeat_reports_sampled_gpu_telemetry(tmp_path: Path) -> None:
+    async with _harness(
+        tmp_path / "workspaces",
+        gpu_sampler=_StaticGpuSampler(GPU_TELEMETRY),  # type: ignore[arg-type]
+    ) as harness:
+        await harness.agent.heartbeat()
+
+        record = await harness.registry.get("worker-a")
+        assert record is not None
+        assert record.gpus == GPU_TELEMETRY
+        assert record.busy_job_id is None
+
+
+@dataclass
+class _BlockingPlugin(_EchoDelegate):
+    """Holds execution open until the test releases it, so `busy_job_id` is
+    observable from outside the agent for as long as the test needs."""
+
+    started: asyncio.Event = field(default_factory=asyncio.Event)
+    release: asyncio.Event = field(default_factory=asyncio.Event)
+
+    async def execute(
+        self, context: ExecutionContext, request: ValidatedRequest
+    ) -> PluginOutput:
+        self.started.set()
+        await self.release.wait()
+        return await self.echo.execute(context, request)
+
+
+async def test_a_heartbeat_reports_the_job_the_agent_is_executing(
+    tmp_path: Path,
+) -> None:
+    plugin = _BlockingPlugin()
+    async with _harness(
+        tmp_path / "workspaces",
+        plugins=(plugin,),
+        gpu_sampler=_StaticGpuSampler(()),  # type: ignore[arg-type]
+    ) as harness:
+        submitted = await harness.submit()
+
+        run_task = asyncio.create_task(harness.agent.run_once())
+        try:
+            await asyncio.wait_for(plugin.started.wait(), timeout=5.0)
+            assert harness.agent._busy_job_id == submitted.job_id
+
+            await harness.agent.heartbeat()
+            record = await harness.registry.get("worker-a")
+            assert record is not None
+            assert record.busy_job_id == submitted.job_id
+        finally:
+            plugin.release.set()
+            await run_task
+
+        # Once the job settles the agent is idle again.
+        assert harness.agent._busy_job_id is None
+
+
+async def test_gpu_sampling_never_raises_out_of_a_heartbeat(tmp_path: Path) -> None:
+    class _ExplodingSampler:
+        def sample(self) -> tuple[GpuTelemetry, ...]:
+            raise RuntimeError("driver went away")
+
+    async with _harness(
+        tmp_path / "workspaces",
+        gpu_sampler=_ExplodingSampler(),  # type: ignore[arg-type]
+    ) as harness:
+        await harness.agent.heartbeat()
+
+        record = await harness.registry.get("worker-a")
+        assert record is not None
+        assert record.gpus == ()

@@ -30,10 +30,12 @@ from outbound_gpu_worker_pool.contracts import (
     MAX_AUDIT_REASON_LENGTH,
     PUBLICATION_MODE_IMMUTABLE_CREATE_ONCE,
     AssetGrant,
+    GpuTelemetry,
     JobFailureCode,
     LeaseGrant,
     WorkerCapability,
 )
+from outbound_gpu_worker_pool.gpu_sampler import GpuSampler
 from outbound_gpu_worker_pool.plugins import (
     ExecutionContext,
     GpuExecutorPlugin,
@@ -154,6 +156,7 @@ class WorkerAgent:
         runtime_versions: Mapping[str, str] = MappingProxyType({}),
         random: Callable[[], float] = random_module.random,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        gpu_sampler: GpuSampler | None = None,
     ) -> None:
         if not plugins:
             raise ValueError("a worker must serve at least one plugin")
@@ -173,6 +176,8 @@ class WorkerAgent:
         self._runtime_versions = dict(runtime_versions)
         self._random = random
         self._sleep = sleep
+        self._gpu_sampler = gpu_sampler if gpu_sampler is not None else GpuSampler()
+        self._busy_job_id: str | None = None
         self._stop: asyncio.Event | None = None
         self._plugins: dict[str, GpuExecutorPlugin] = {}
         self._capabilities: dict[str, WorkerCapability] = {}
@@ -192,6 +197,7 @@ class WorkerAgent:
         return tuple(self._capabilities)
 
     async def heartbeat(self, draining: bool = False) -> None:
+        gpus = await self._sample_gpus()
         response = await self._http.post(
             self._route("/worker/v1/heartbeat"),
             headers=self._headers(),
@@ -210,9 +216,21 @@ class WorkerAgent:
                 "vram_mb": self._vram_mb,
                 "runtime_versions": self._runtime_versions,
                 "draining": draining,
+                "gpus": [_gpu_telemetry_json(gpu) for gpu in gpus],
+                "busy_job_id": self._busy_job_id,
             },
         )
         response.raise_for_status()
+
+    async def _sample_gpus(self) -> tuple[GpuTelemetry, ...]:
+        # Sampling must never delay or fail a heartbeat: any sampler failure is
+        # already swallowed inside GpuSampler, but a broken injected sampler in a
+        # test or a future rewrite should not take the heartbeat down with it.
+        try:
+            return await asyncio.to_thread(self._gpu_sampler.sample)
+        except Exception:
+            logger.warning("gpu telemetry sampling raised unexpectedly", exc_info=True)
+            return ()
 
     async def run_once(self) -> AgentOutcome:
         await self.heartbeat()
@@ -266,6 +284,7 @@ class WorkerAgent:
         cancel = asyncio.Event()
         heartbeats: asyncio.Task[None] | None = None
         started = time.monotonic()
+        self._busy_job_id = lease.job_id
         try:
             try:
                 input_paths = await self._download_inputs(lease, workspace)
@@ -289,6 +308,7 @@ class WorkerAgent:
             except Exception as exc:
                 return await self._release(lease, reason=type(exc).__name__)
         finally:
+            self._busy_job_id = None
             cancel.set()
             if heartbeats is not None:
                 heartbeats.cancel()
@@ -497,6 +517,16 @@ def _digest_file(path: Path) -> tuple[str, int]:
             digest.update(chunk)
             byte_length += len(chunk)
     return digest.hexdigest(), byte_length
+
+
+def _gpu_telemetry_json(gpu: GpuTelemetry) -> dict:
+    return {
+        "index": gpu.index,
+        "name": gpu.name,
+        "utilization_pct": gpu.utilization_pct,
+        "memory_used_mb": gpu.memory_used_mb,
+        "memory_total_mb": gpu.memory_total_mb,
+    }
 
 
 def _asset_grant(payload: dict) -> AssetGrant:

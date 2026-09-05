@@ -7,10 +7,10 @@ in responses, where the coordinator itself minted them. A worker learns nothing
 about who a job belongs to: `tenant_id` is not part of any response.
 """
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Path, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -19,15 +19,22 @@ from outbound_gpu_worker_pool.contracts import (
     MAX_ASSET_KEY_LENGTH,
     MAX_AUDIT_REASON_LENGTH,
     MAX_CAPABILITY_ID_LENGTH,
+    MAX_GPU_NAME_LENGTH,
     MAX_JOB_ID_LENGTH,
+    MAX_WORKER_GPUS,
     MAX_WORKER_ID_LENGTH,
     AssetGrant,
+    CapabilityQueueDepth,
     CostClass,
+    GpuTelemetry,
     JobFailureCode,
     JobPayload,
     JobPayloadValue,
     LeaseGrant,
     OutputManifest,
+    PoolWorkerStatus,
+    PoolWorkerView,
+    QueueDepth,
     WorkerAuthError,
     WorkerCapability,
     WorkerIdentity,
@@ -101,6 +108,35 @@ class WorkerCapabilityDto(BaseModel):
     concurrency: int = Field(default=1, ge=1, le=64)
 
 
+class GpuTelemetryDto(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    index: int = Field(ge=0, le=63)
+    name: str = Field(min_length=1, max_length=MAX_GPU_NAME_LENGTH)
+    utilization_pct: int | None = Field(default=None, ge=0, le=100)
+    memory_used_mb: int | None = Field(default=None, ge=0, le=1_000_000)
+    memory_total_mb: int | None = Field(default=None, ge=0, le=1_000_000)
+
+    def to_telemetry(self) -> GpuTelemetry:
+        return GpuTelemetry(
+            index=self.index,
+            name=self.name,
+            utilization_pct=self.utilization_pct,
+            memory_used_mb=self.memory_used_mb,
+            memory_total_mb=self.memory_total_mb,
+        )
+
+    @classmethod
+    def from_telemetry(cls, telemetry: GpuTelemetry) -> "GpuTelemetryDto":
+        return cls(
+            index=telemetry.index,
+            name=telemetry.name,
+            utilization_pct=telemetry.utilization_pct,
+            memory_used_mb=telemetry.memory_used_mb,
+            memory_total_mb=telemetry.memory_total_mb,
+        )
+
+
 class WorkerHeartbeatRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -122,6 +158,10 @@ class WorkerHeartbeatRequest(BaseModel):
     )
     active_leases: int = Field(default=0, ge=0, le=64)
     draining: bool = False
+    gpus: list[GpuTelemetryDto] = Field(
+        default_factory=list, max_length=MAX_WORKER_GPUS
+    )
+    busy_job_id: str | None = Field(default=None, max_length=MAX_JOB_ID_LENGTH)
 
     def to_registration(self) -> WorkerRegistration:
         return WorkerRegistration(
@@ -142,6 +182,8 @@ class WorkerHeartbeatRequest(BaseModel):
             labels=tuple(self.labels),
             active_leases=self.active_leases,
             draining=self.draining,
+            gpus=tuple(gpu.to_telemetry() for gpu in self.gpus),
+            busy_job_id=self.busy_job_id,
         )
 
 
@@ -304,6 +346,58 @@ class SettleResponse(BaseModel):
     status: str
 
 
+class PoolWorkerResponse(BaseModel):
+    worker_id: str
+    status: PoolWorkerStatus
+    last_heartbeat_at: datetime | None
+    capabilities: list[str]
+    gpus: list[GpuTelemetryDto]
+    busy_job_id: str | None
+    draining: bool
+
+    @classmethod
+    def from_view(cls, view: PoolWorkerView) -> "PoolWorkerResponse":
+        return cls(
+            worker_id=view.worker_id,
+            status=view.status,
+            last_heartbeat_at=view.last_heartbeat_at,
+            capabilities=list(view.capability_ids),
+            gpus=[GpuTelemetryDto.from_telemetry(gpu) for gpu in view.gpus],
+            busy_job_id=view.busy_job_id,
+            draining=view.draining,
+        )
+
+
+class PoolWorkersResponse(BaseModel):
+    workers: list[PoolWorkerResponse]
+
+
+class CapabilityQueueDepthResponse(BaseModel):
+    queued: int
+    processing: int
+
+    @classmethod
+    def from_depth(cls, depth: CapabilityQueueDepth) -> "CapabilityQueueDepthResponse":
+        return cls(queued=depth.queued, processing=depth.processing)
+
+
+class PoolQueueResponse(BaseModel):
+    queued: int
+    processing: int
+    by_capability: dict[str, CapabilityQueueDepthResponse]
+
+    @classmethod
+    def from_depth(cls, depth: QueueDepth) -> "PoolQueueResponse":
+        return cls(
+            queued=depth.queued,
+            processing=depth.processing,
+            by_capability={
+                capability_id: CapabilityQueueDepthResponse.from_depth(capability_depth)
+                for capability_id, capability_depth in depth.by_capability.items()
+            },
+        )
+
+
 def create_worker_router(service: WorkerPoolService) -> APIRouter:
     router = APIRouter(prefix="/worker/v1", tags=["worker-pool"])
 
@@ -392,5 +486,35 @@ def create_worker_router(service: WorkerPoolService) -> APIRouter:
         _identity: Identity,
     ) -> dict[str, dict[str, JobPayloadValue]]:
         return service.capabilities_schema()
+
+    return router
+
+
+def create_pool_status_router(
+    service: WorkerPoolService, *, dependencies: Sequence[Any] = ()
+) -> APIRouter:
+    """Read-only pool status for a host's own UI: `GET /pool/workers`, `GET /pool/queue`.
+
+    The library ships no authenticated product routes of its own — mount this
+    next to your own `/pool/jobs` routes with the same `dependencies` (a list of
+    FastAPI `Depends(...)`) your host already uses to gate them. Both routes are
+    cheap: worker status comes from the registry's already-loaded rows, and the
+    queue depth is a bounded aggregate, never a full job listing.
+    """
+    router = APIRouter(
+        prefix="/pool", tags=["pool-status"], dependencies=list(dependencies)
+    )
+
+    @router.get("/workers", response_model=PoolWorkersResponse)
+    async def list_pool_workers() -> PoolWorkersResponse:
+        views = await service.worker_views()
+        return PoolWorkersResponse(
+            workers=[PoolWorkerResponse.from_view(view) for view in views]
+        )
+
+    @router.get("/queue", response_model=PoolQueueResponse)
+    async def pool_queue() -> PoolQueueResponse:
+        depth = await service.queue_depth()
+        return PoolQueueResponse.from_depth(depth)
 
     return router

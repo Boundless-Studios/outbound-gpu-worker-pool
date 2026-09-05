@@ -143,9 +143,32 @@ publish over HTTP is the authenticated worker surface: mount `create_worker_rout
 next to your own routes, or run `create_coordinator_app(service)` as its own deployment when
 workers should reach a service that holds nothing else.
 
-`PostgresJobStore.start()` applies the migrations in `migrations/001_worker_pool.sql` under an
-advisory lock, creating `pool_jobs`, `pool_workers`, and `pool_audit_events`. Every table name
-is a module constant so your own reporting can read them.
+`PostgresJobStore.start()` applies the migrations in `migrations/001_worker_pool.sql` and
+`migrations/002_worker_telemetry.sql` under an advisory lock, creating `pool_jobs`,
+`pool_workers`, and `pool_audit_events` and adding the `gpus` and `busy_job_id` columns to
+`pool_workers`. Every table name is a module constant so your own reporting can read them.
+
+### Pool status routes
+
+For a product surface that wants pool availability at a glance without polling every worker
+itself, `create_pool_status_router(service, *, dependencies=())` publishes two read-only,
+cheap routes. It carries no auth of its own — pass the same `dependencies` (a list of FastAPI
+`Depends(...)`) your host already uses to gate its own `/pool/jobs` routes, and mount it next
+to them:
+
+```python
+from outbound_gpu_worker_pool.routes import create_pool_status_router
+
+app.include_router(create_pool_status_router(service, dependencies=[Depends(my_auth)]))
+```
+
+- **`GET /pool/workers`** — `{"workers": [{worker_id, status, last_heartbeat_at, capabilities,
+  gpus, busy_job_id, draining}, ...]}`. `status` is `busy` when the worker's last heartbeat
+  carried a `busy_job_id`, else `draining` when the registry has it draining, else `online`
+  when the heartbeat is within 90 seconds, else `offline`. A worker never heard from, or not
+  heard from in the last 24 hours, is omitted entirely rather than reported offline.
+- **`GET /pool/queue`** — `{"queued": n, "processing": n, "by_capability": {capability_id:
+  {"queued": n, "processing": n}}}`, a bounded aggregate count, never a job listing.
 
 ## Enrolling a worker
 
@@ -238,6 +261,13 @@ python -m outbound_gpu_worker_pool.agent_main
 | `OGWP_WORKER_MAX_INPUT_BYTES` | default `2147483648` (2 GiB) | the scratch bound: a single granted input larger than this aborts the download and releases the job |
 | `OGWP_WORKER_GPU_MODEL` | free text | advertised to the registry |
 | `OGWP_WORKER_VRAM_MB` | integer | advertised to the registry |
+| `OGWP_NVIDIA_SMI` | path | overrides binary resolution for per-GPU telemetry sampling; otherwise `nvidia-smi` on `PATH`, then `/usr/lib/wsl/lib/nvidia-smi` |
+
+Every heartbeat also samples per-GPU utilization and memory with `nvidia-smi` (a 3 second
+timeout, run off the event loop) and reports the job it is currently executing, if any. Neither
+can delay or fail a heartbeat: a missing or failing `nvidia-smi` logs one warning and reports no
+GPUs rather than retrying or raising. See [Pool status routes](#pool-status-routes) for how a
+host surfaces this.
 
 SIGTERM and SIGINT drain: the in-flight job finishes, a final draining heartbeat is sent, and
 the process exits 0. A lease taken as draining begins is released back to the pool rather than

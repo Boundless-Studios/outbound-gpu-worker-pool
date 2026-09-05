@@ -18,7 +18,9 @@ from outbound_gpu_worker_pool.contracts import (
     ATTEMPT_BUDGET_EXHAUSTED,
     AuditEvent,
     AuditEventType,
+    CapabilityQueueDepth,
     CostClass,
+    GpuTelemetry,
     IdempotencyConflict,
     IdentitySubjectTaken,
     JobFailureCode,
@@ -26,6 +28,7 @@ from outbound_gpu_worker_pool.contracts import (
     JobRecord,
     JobStatus,
     JobSubmission,
+    QueueDepth,
     SubmissionResult,
     WorkerCapability,
     WorkerRecord,
@@ -42,7 +45,7 @@ POOL_WORKERS_TABLE = "pool_workers"
 POOL_AUDIT_EVENTS_TABLE = "pool_audit_events"
 
 MIGRATIONS_PACKAGE = "outbound_gpu_worker_pool.migrations"
-MIGRATION_FILES = ("001_worker_pool.sql",)
+MIGRATION_FILES = ("001_worker_pool.sql", "002_worker_telemetry.sql")
 MIGRATION_ADVISORY_LOCK_KEY = "outbound_gpu_worker_pool.migrations"
 
 
@@ -289,6 +292,33 @@ class PostgresJobStore(_PoolOwner):
             )
         return int(result.rsplit(" ", 1)[-1])
 
+    async def queue_depth(self) -> QueueDepth:
+        async with self._require_pool().acquire() as connection:
+            rows = await connection.fetch(
+                f"""SELECT capability_id, status, count(*) AS n
+                    FROM {POOL_JOBS_TABLE}
+                    WHERE status IN ('queued', 'processing')
+                    GROUP BY capability_id, status"""
+            )
+        totals = {"queued": 0, "processing": 0}
+        by_capability: dict[str, dict[str, int]] = {}
+        for row in rows:
+            status = str(row["status"])
+            count = int(row["n"])
+            totals[status] += count
+            counts = by_capability.setdefault(
+                row["capability_id"], {"queued": 0, "processing": 0}
+            )
+            counts[status] = count
+        return QueueDepth(
+            queued=totals["queued"],
+            processing=totals["processing"],
+            by_capability={
+                capability_id: CapabilityQueueDepth(**counts)
+                for capability_id, counts in by_capability.items()
+            },
+        )
+
 
 class PostgresWorkerRegistry(_PoolOwner):
     async def upsert(
@@ -302,10 +332,10 @@ class PostgresWorkerRegistry(_PoolOwner):
                     INSERT INTO {POOL_WORKERS_TABLE} (
                         worker_id, identity_subject, status, capabilities, gpu_model,
                         vram_mb, runtime_versions, cost_class, labels, active_leases,
-                        last_heartbeat_at, updated_at
+                        last_heartbeat_at, updated_at, gpus, busy_job_id
                     )
                     VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7::jsonb, $8, $9::jsonb,
-                            $10, now(), now())
+                            $10, now(), now(), $11::jsonb, $12::uuid)
                     ON CONFLICT (worker_id) DO UPDATE SET
                         identity_subject = EXCLUDED.identity_subject,
                         status = CASE
@@ -320,7 +350,9 @@ class PostgresWorkerRegistry(_PoolOwner):
                         labels = EXCLUDED.labels,
                         active_leases = EXCLUDED.active_leases,
                         last_heartbeat_at = now(),
-                        updated_at = now()
+                        updated_at = now(),
+                        gpus = EXCLUDED.gpus,
+                        busy_job_id = EXCLUDED.busy_job_id
                     RETURNING *
                     """,
                     registration.worker_id,
@@ -333,6 +365,8 @@ class PostgresWorkerRegistry(_PoolOwner):
                     registration.cost_class,
                     json.dumps(list(registration.labels)),
                     registration.active_leases,
+                    json.dumps([asdict(item) for item in registration.gpus]),
+                    registration.busy_job_id,
                 )
             except asyncpg.UniqueViolationError as exc:
                 raise IdentitySubjectTaken(identity_subject) from exc
@@ -458,6 +492,10 @@ def _worker_record(row: Any) -> WorkerRecord:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         revoked_at=row["revoked_at"],
+        gpus=tuple(GpuTelemetry(**gpu) for gpu in _json_value(row["gpus"])),
+        busy_job_id=(
+            str(row["busy_job_id"]) if row["busy_job_id"] is not None else None
+        ),
     )
 
 
