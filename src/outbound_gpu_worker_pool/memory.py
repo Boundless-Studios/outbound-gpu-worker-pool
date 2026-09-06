@@ -35,6 +35,7 @@ from outbound_gpu_worker_pool.contracts import (
     WorkerRecord,
     WorkerRegistration,
     WorkerStatus,
+    WorkerTenantMismatch,
 )
 from outbound_gpu_worker_pool.validation import (
     job_request_digest,
@@ -71,6 +72,7 @@ class MemoryJobStore:
             contract_version=submission.contract_version,
             payload=deepcopy(submission.payload),
             tenant_id=submission.tenant_id,
+            requirements=submission.requirements,
             priority=submission.priority,
             attempt_budget=submission.attempt_budget,
             execution_deadline_seconds=submission.execution_deadline_seconds,
@@ -109,7 +111,15 @@ class MemoryJobStore:
         return True
 
     async def lease(
-        self, *, worker_id: str, capability_ids: tuple[str, ...], lease_seconds: int
+        self,
+        *,
+        worker_id: str,
+        capability_ids: tuple[str, ...],
+        lease_seconds: int,
+        tenant_id: str | None = None,
+        vram_mb: int | None = None,
+        gpu_model: str | None = None,
+        labels: tuple[str, ...] = (),
     ) -> JobRecord | None:
         now = datetime.now(UTC)
         candidates = [
@@ -117,6 +127,8 @@ class MemoryJobStore:
             for record in self.records.values()
             if record.capability_id in capability_ids
             and record.attempts < record.attempt_budget
+            and record.tenant_id == tenant_id
+            and _satisfies_requirements(record, vram_mb, gpu_model, labels)
             and _is_leasable(record, now)
         ]
         if not candidates:
@@ -357,6 +369,8 @@ class MemoryWorkerRegistry:
         now = datetime.now(UTC)
         status = WorkerStatus.DRAINING if registration.draining else WorkerStatus.ACTIVE
         existing = self.workers.get(registration.worker_id)
+        if existing is not None and existing.tenant_id != registration.tenant_id:
+            raise WorkerTenantMismatch(registration.worker_id)
         if existing is not None and existing.status is WorkerStatus.REVOKED:
             status = WorkerStatus.REVOKED
         for other in self.workers.values():
@@ -382,6 +396,7 @@ class MemoryWorkerRegistry:
             revoked_at=existing.revoked_at if existing is not None else None,
             gpus=registration.gpus,
             busy_job_id=registration.busy_job_id,
+            tenant_id=registration.tenant_id,
         )
         self.workers[record.worker_id] = record
         return record
@@ -397,6 +412,11 @@ class MemoryWorkerRegistry:
 
     async def list(self) -> tuple[WorkerRecord, ...]:
         return tuple(self.workers[worker_id] for worker_id in sorted(self.workers))
+
+    async def list_by_tenant(self, tenant_id: str | None) -> tuple[WorkerRecord, ...]:
+        return tuple(
+            record for record in await self.list() if record.tenant_id == tenant_id
+        )
 
     async def set_status(self, worker_id: str, status: WorkerStatus) -> bool:
         record = self.workers.get(worker_id)
@@ -477,6 +497,24 @@ def _settled(record: JobRecord) -> JobRecord:
     )
 
 
+def _satisfies_requirements(
+    record: JobRecord,
+    vram_mb: int | None,
+    gpu_model: str | None,
+    labels: tuple[str, ...],
+) -> bool:
+    """The memory mirror of the Postgres requirement predicates."""
+    requirements = record.requirements
+    if (requirements.min_vram_mb or 0) > (vram_mb or 0):
+        return False
+    if requirements.gpu_models and (
+        gpu_model is None
+        or gpu_model.lower() not in {model.lower() for model in requirements.gpu_models}
+    ):
+        return False
+    return set(requirements.labels) <= set(labels)
+
+
 def _is_leasable(record: JobRecord, now: datetime) -> bool:
     if record.status is JobStatus.QUEUED:
         return True
@@ -495,6 +533,7 @@ def _replays(record: JobRecord, submission: JobSubmission) -> bool:
         and record.output_key == submission.output_key
         and record.payload == submission.payload
         and record.tenant_id == submission.tenant_id
+        and record.requirements == submission.requirements
         and record.priority == submission.priority
         and record.attempt_budget == submission.attempt_budget
         and record.execution_deadline_seconds == submission.execution_deadline_seconds

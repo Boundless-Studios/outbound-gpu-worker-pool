@@ -185,17 +185,25 @@ class WorkerPoolService:
     async def worker_views(
         self,
         *,
+        tenant_id: str | None = None,
         online_window_seconds: int = POOL_WORKER_ONLINE_WINDOW_SECONDS,
         visibility_window_seconds: int = POOL_WORKER_VISIBILITY_WINDOW_SECONDS,
     ) -> tuple[PoolWorkerView, ...]:
         """The rows for a host's `GET /pool/workers`.
 
-        A worker never heard from, or not heard from in `visibility_window_seconds`
+        `tenant_id` narrows to one tenant's machines exactly, so a host can show a
+        user their own hardware; omit it for every worker the pool knows. A worker
+        never heard from, or not heard from in `visibility_window_seconds`
         (default 24h), is omitted entirely rather than reported offline.
         """
         now = self._clock()
         views: list[PoolWorkerView] = []
-        for record in await self._registry.list():
+        records = (
+            await self._registry.list()
+            if tenant_id is None
+            else await self._registry.list_by_tenant(tenant_id)
+        )
+        for record in records:
             if record.last_heartbeat_at is None:
                 continue
             age_seconds = (now - record.last_heartbeat_at).total_seconds()
@@ -219,13 +227,31 @@ class WorkerPoolService:
                     gpus=record.gpus,
                     busy_job_id=record.busy_job_id,
                     draining=draining,
+                    tenant_id=record.tenant_id,
                 )
             )
         return tuple(views)
 
     async def queue_depth(self) -> QueueDepth:
-        """Bounded queue depth for a host's `GET /pool/queue`."""
-        return await self._jobs.queue_depth()
+        """Bounded queue depth plus online worker counts for `GET /pool/queue`.
+
+        The worker counts come from the registry's own bounded rows, so telling
+        "nothing can run this capability" from "waiting its turn" costs no job scan.
+        """
+        depth = await self._jobs.queue_depth()
+        now = self._clock()
+        online: dict[str, int] = {}
+        for record in await self._registry.list():
+            if record.last_heartbeat_at is None:
+                continue
+            if record.status is WorkerStatus.REVOKED:
+                continue
+            age_seconds = (now - record.last_heartbeat_at).total_seconds()
+            if age_seconds > POOL_WORKER_ONLINE_WINDOW_SECONDS:
+                continue
+            for capability_id in record.capability_ids:
+                online[capability_id] = online.get(capability_id, 0) + 1
+        return replace(depth, online_workers_by_capability=online)
 
     async def audit_for_job(self, job_id: str) -> tuple[AuditEvent, ...]:
         return await self._audit.list_for_job(job_id)
@@ -301,6 +327,10 @@ class WorkerPoolService:
             worker_id=identity.worker_id,
             capability_ids=effective,
             lease_seconds=seconds,
+            tenant_id=worker.tenant_id,
+            vram_mb=worker.vram_mb,
+            gpu_model=worker.gpu_model,
+            labels=worker.labels,
         )
         if job is None:
             await self._audit.record(

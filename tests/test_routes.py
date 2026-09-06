@@ -101,6 +101,7 @@ def heartbeat(
     capability_ids: tuple[str, ...] = (ECHO,),
     *,
     draining: bool = False,
+    tenant_id: str | None = "tenant-a",
 ):
     return client.post(
         "/worker/v1/heartbeat",
@@ -118,6 +119,7 @@ def heartbeat(
             ],
             "runtime_versions": {"python": "3.13"},
             "draining": draining,
+            "tenant_id": tenant_id,
         },
     )
 

@@ -20,11 +20,15 @@ from outbound_gpu_worker_pool.contracts import (
     MAX_JOB_PAYLOAD_BYTES,
     MAX_JOB_PAYLOAD_DEPTH,
     MAX_JOB_PRIORITY,
+    MAX_JOB_REQUIREMENT_ENTRIES,
+    MAX_REQUIREMENT_VALUE_LENGTH,
+    MAX_REQUIREMENT_VRAM_MB,
     MIN_EXECUTION_DEADLINE_SECONDS,
     MIN_JOB_ATTEMPT_BUDGET,
     MIN_JOB_PRIORITY,
     JobPayload,
     JobPayloadValue,
+    JobRequirements,
     JobSubmission,
 )
 
@@ -97,7 +101,29 @@ def validate_job_submission(submission: JobSubmission) -> None:
     ):
         if not minimum <= value <= maximum:
             raise ValueError(f"{label} must be between {minimum} and {maximum}")
+    validate_job_requirements(submission.requirements)
     validate_job_payload(submission.payload)
+
+
+def validate_job_requirements(requirements: JobRequirements) -> None:
+    if requirements.min_vram_mb is not None and not (
+        0 <= requirements.min_vram_mb <= MAX_REQUIREMENT_VRAM_MB
+    ):
+        raise ValueError(f"min_vram_mb must be between 0 and {MAX_REQUIREMENT_VRAM_MB}")
+    for label, values in (
+        ("gpu_models", requirements.gpu_models),
+        ("labels", requirements.labels),
+    ):
+        if len(values) > MAX_JOB_REQUIREMENT_ENTRIES:
+            raise ValueError(
+                f"{label} must hold at most {MAX_JOB_REQUIREMENT_ENTRIES} entries"
+            )
+        for value in values:
+            if not value or len(value) > MAX_REQUIREMENT_VALUE_LENGTH:
+                raise ValueError(
+                    f"{label} entries must contain 1 to "
+                    f"{MAX_REQUIREMENT_VALUE_LENGTH} characters"
+                )
 
 
 def validate_job_payload(payload: JobPayload) -> None:

@@ -4,7 +4,9 @@ Every request DTO is closed (`extra="forbid"`) and every string is length bounde
 so nothing a worker sends can widen the coordinator's input surface. No request DTO
 accepts a URL, path, command, or workflow graph; the signed grant URLs appear only
 in responses, where the coordinator itself minted them. A worker learns nothing
-about who a job belongs to: `tenant_id` is not part of any response.
+about who a job belongs to: no `/worker/v1` response carries a job's `tenant_id`.
+A worker declares its own tenant on its first heartbeat and can never change it;
+the host-facing pool status routes are the only place a tenant is reported.
 """
 
 from collections.abc import Iterator, Sequence
@@ -12,7 +14,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Path, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from outbound_gpu_worker_pool.contracts import (
@@ -21,6 +23,7 @@ from outbound_gpu_worker_pool.contracts import (
     MAX_CAPABILITY_ID_LENGTH,
     MAX_GPU_NAME_LENGTH,
     MAX_JOB_ID_LENGTH,
+    MAX_TENANT_ID_LENGTH,
     MAX_WORKER_GPUS,
     MAX_WORKER_ID_LENGTH,
     AssetGrant,
@@ -41,6 +44,7 @@ from outbound_gpu_worker_pool.contracts import (
     WorkerRecord,
     WorkerRegistration,
     WorkerStatus,
+    WorkerTenantMismatch,
 )
 from outbound_gpu_worker_pool.service import (
     CompletionRejected,
@@ -89,6 +93,10 @@ def _mapped_errors() -> Iterator[None]:
         raise HTTPException(status_code=403, detail="worker is revoked") from exc
     except RateLimited as exc:
         raise HTTPException(status_code=429, detail="worker rate limit") from exc
+    except WorkerTenantMismatch as exc:
+        raise HTTPException(
+            status_code=409, detail="worker tenant is fixed at enrollment"
+        ) from exc
     except (WorkerMismatch, WorkerNotRegistered) as exc:
         raise HTTPException(
             status_code=409, detail="worker registration conflict"
@@ -146,6 +154,9 @@ class WorkerHeartbeatRequest(BaseModel):
     capabilities: list[WorkerCapabilityDto] = Field(
         min_length=1, max_length=MAX_CAPABILITIES
     )
+    tenant_id: str | None = Field(
+        default=None, min_length=1, max_length=MAX_TENANT_ID_LENGTH
+    )
     gpu_model: str | None = Field(default=None, max_length=64)
     vram_mb: int | None = Field(default=None, ge=0, le=1_000_000)
     runtime_versions: dict[
@@ -175,6 +186,7 @@ class WorkerHeartbeatRequest(BaseModel):
                 )
                 for capability in self.capabilities
             ),
+            tenant_id=self.tenant_id,
             gpu_model=self.gpu_model,
             vram_mb=self.vram_mb,
             runtime_versions=dict(self.runtime_versions),
@@ -354,6 +366,7 @@ class PoolWorkerResponse(BaseModel):
     gpus: list[GpuTelemetryDto]
     busy_job_id: str | None
     draining: bool
+    tenant_id: str | None
 
     @classmethod
     def from_view(cls, view: PoolWorkerView) -> "PoolWorkerResponse":
@@ -365,6 +378,7 @@ class PoolWorkerResponse(BaseModel):
             gpus=[GpuTelemetryDto.from_telemetry(gpu) for gpu in view.gpus],
             busy_job_id=view.busy_job_id,
             draining=view.draining,
+            tenant_id=view.tenant_id,
         )
 
 
@@ -385,6 +399,7 @@ class PoolQueueResponse(BaseModel):
     queued: int
     processing: int
     by_capability: dict[str, CapabilityQueueDepthResponse]
+    online_workers_by_capability: dict[str, int]
 
     @classmethod
     def from_depth(cls, depth: QueueDepth) -> "PoolQueueResponse":
@@ -395,6 +410,7 @@ class PoolQueueResponse(BaseModel):
                 capability_id: CapabilityQueueDepthResponse.from_depth(capability_depth)
                 for capability_id, capability_depth in depth.by_capability.items()
             },
+            online_workers_by_capability=dict(depth.online_workers_by_capability),
         )
 
 
@@ -506,8 +522,12 @@ def create_pool_status_router(
     )
 
     @router.get("/workers", response_model=PoolWorkersResponse)
-    async def list_pool_workers() -> PoolWorkersResponse:
-        views = await service.worker_views()
+    async def list_pool_workers(
+        tenant_id: Annotated[
+            str | None, Query(min_length=1, max_length=MAX_TENANT_ID_LENGTH)
+        ] = None,
+    ) -> PoolWorkersResponse:
+        views = await service.worker_views(tenant_id=tenant_id)
         return PoolWorkersResponse(
             workers=[PoolWorkerResponse.from_view(view) for view in views]
         )

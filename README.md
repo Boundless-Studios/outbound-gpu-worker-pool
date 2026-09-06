@@ -143,10 +143,12 @@ publish over HTTP is the authenticated worker surface: mount `create_worker_rout
 next to your own routes, or run `create_coordinator_app(service)` as its own deployment when
 workers should reach a service that holds nothing else.
 
-`PostgresJobStore.start()` applies the migrations in `migrations/001_worker_pool.sql` and
-`migrations/002_worker_telemetry.sql` under an advisory lock, creating `pool_jobs`,
-`pool_workers`, and `pool_audit_events` and adding the `gpus` and `busy_job_id` columns to
-`pool_workers`. Every table name is a module constant so your own reporting can read them.
+`PostgresJobStore.start()` applies the migrations in `migrations/001_worker_pool.sql`,
+`migrations/002_worker_telemetry.sql`, and `migrations/003_worker_tenancy.sql` under an
+advisory lock, creating `pool_jobs`, `pool_workers`, and `pool_audit_events`, adding the
+`gpus` and `busy_job_id` columns to `pool_workers`, and adding `pool_workers.tenant_id`
+and `pool_jobs.requirements`. Every migration is add-only and idempotent, so a replay
+changes no column: nothing here ever drops a column a later start recreates. Every table name is a module constant so your own reporting can read them.
 
 ### Pool status routes
 
@@ -163,12 +165,52 @@ app.include_router(create_pool_status_router(service, dependencies=[Depends(my_a
 ```
 
 - **`GET /pool/workers`** — `{"workers": [{worker_id, status, last_heartbeat_at, capabilities,
-  gpus, busy_job_id, draining}, ...]}`. `status` is `busy` when the worker's last heartbeat
+  gpus, busy_job_id, draining, tenant_id}, ...]}`. `?tenant_id=…` narrows to one tenant's
+  machines (`tenant_id` is null for a house worker). `status` is `busy` when the worker's last heartbeat
   carried a `busy_job_id`, else `draining` when the registry has it draining, else `online`
   when the heartbeat is within 90 seconds, else `offline`. A worker never heard from, or not
   heard from in the last 24 hours, is omitted entirely rather than reported offline.
 - **`GET /pool/queue`** — `{"queued": n, "processing": n, "by_capability": {capability_id:
-  {"queued": n, "processing": n}}}`, a bounded aggregate count, never a job listing.
+  {"queued": n, "processing": n}}, "online_workers_by_capability": {capability_id: n}}`,
+  bounded aggregate counts, never a job listing. The worker counts come from the registry's
+  own rows (no job scan) and tell "queued with nothing online that serves this capability"
+  from "queued, waiting its turn". They count capability only: tenancy and a job's
+  `requirements` narrow further, so a nonzero count is not proof a *particular* job is
+  leasable.
+
+## Worker tenancy
+
+A machine can belong to one tenant, so it only ever runs that tenant's work.
+
+- **`pool_workers.tenant_id` null means the house pool** — the shared machines an
+  operator runs. A worker sets its tenant on its first heartbeat
+  (`OGWP_WORKER_TENANT`, or `tenant_id` on the registration) and it is fixed from
+  then on: a later heartbeat presenting a different tenant is refused with `409`
+  and the row keeps the tenant it enrolled with.
+- **The rule for leasing is exact-match, both ways.** A tenanted worker leases only
+  that tenant's jobs; a house worker leases only untenanted ones. There is no
+  spillover and no fallback: a tenant whose machine is offline sees their jobs
+  wait rather than quietly consume the house pool, and house work never lands on
+  somebody's own hardware.
+- **A job's tenant is the host's to set** (`JobSubmission.tenant_id`), alongside
+  `service.list_for_tenant(tenant_id)` and `GET /pool/workers?tenant_id=…` for
+  showing one user their own machines.
+
+## Hardware requirements
+
+A job may also declare what the machine must offer, in `JobSubmission.requirements`
+(`JobRequirements`), and only a worker that satisfies all of it may lease the job:
+
+| Field | Meaning |
+|---|---|
+| `min_vram_mb` | the worker's advertised `vram_mb` must be at least this; a worker that advertises none matches only jobs with no `min_vram_mb` |
+| `gpu_models` | any-of, matched case-insensitively against the worker's `gpu_model` |
+| `labels` | all-of: every label must be one the worker advertises |
+
+Empty requirements — the default — mean any worker serving the capability. This
+composes with tenancy rather than replacing it: the right tenant with too little
+VRAM still does not lease. Requirements and placement are matched in the lease
+statement itself, so an ineligible worker never sees the job at all.
 
 ## Enrolling a worker
 
@@ -259,8 +301,9 @@ python -m outbound_gpu_worker_pool.agent_main
 | `OGWP_WORKER_CONCURRENCY` | default `1` | leases this machine advertises per capability |
 | `OGWP_WORKER_WORKSPACE` | path, default `<tmpdir>/outbound-gpu-worker` | per-job workspaces are created and deleted under here |
 | `OGWP_WORKER_MAX_INPUT_BYTES` | default `2147483648` (2 GiB) | the scratch bound: a single granted input larger than this aborts the download and releases the job |
-| `OGWP_WORKER_GPU_MODEL` | free text | advertised to the registry |
-| `OGWP_WORKER_VRAM_MB` | integer | advertised to the registry |
+| `OGWP_WORKER_TENANT` | tenant id, default unset | whose machine this is; unset joins the house pool. Fixed at enrollment — see [Worker tenancy](#worker-tenancy) |
+| `OGWP_WORKER_GPU_MODEL` | free text | advertised to the registry; also matched against a job's `gpu_models` requirement |
+| `OGWP_WORKER_VRAM_MB` | integer | advertised to the registry; also matched against a job's `min_vram_mb` requirement |
 | `OGWP_NVIDIA_SMI` | path | overrides binary resolution for per-GPU telemetry sampling; otherwise `nvidia-smi` on `PATH`, then `/usr/lib/wsl/lib/nvidia-smi` |
 
 Every heartbeat also samples per-GPU utilization and memory with `nvidia-smi` (a 3 second
