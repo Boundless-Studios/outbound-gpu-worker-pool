@@ -13,7 +13,8 @@ handed to a host: `claim_token` is the lease secret and leaves only in a grant.
 """
 
 import hashlib
-from collections.abc import Callable
+from collections import OrderedDict
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
@@ -42,12 +43,16 @@ from outbound_gpu_worker_pool.contracts import (
     QueueDepth,
     WorkerAuthenticator,
     WorkerAuthError,
+    WorkerAuthBusy,
+    WorkerIdentityMismatch,
+    WorkerTenantMismatch,
     WorkerIdentity,
     WorkerRecord,
     WorkerRegistration,
     WorkerRegistry,
     WorkerStatus,
 )
+from outbound_gpu_worker_pool.enrollment import WorkerEnrollment, validate_enrollments
 from outbound_gpu_worker_pool.validation import validate_capability_id
 
 OUTPUT_UPLOAD_CONTENT_TYPE = "application/octet-stream"
@@ -87,22 +92,40 @@ class CompletionRejected(ValueError):
 
 
 class RateLimiter:
-    """A token bucket per key, refilled continuously from the injected clock."""
+    """Bounded per-key token buckets; idle keys expire after a full refill.
 
-    def __init__(self, limit_per_minute: int, clock: Callable[[], datetime]) -> None:
+    Active buckets are never evicted to admit a new key: doing so would let key
+    churn reset a caller's budget. At capacity, new keys fail closed. Source
+    checks precede the global budget, so one saturated peer cannot consume it.
+    """
+
+    def __init__(
+        self, limit_per_minute: int, clock: Callable[[], datetime], *, max_keys: int = 4096
+    ) -> None:
+        if limit_per_minute < 1 or max_keys < 1:
+            raise ValueError("rate limits and bucket capacity must be positive")
         self._limit = float(limit_per_minute)
         self._clock = clock
-        self._buckets: dict[str, tuple[float, datetime]] = {}
+        self._max_keys = max_keys
+        self._buckets: OrderedDict[str, tuple[float, datetime]] = OrderedDict()
 
     def allow(self, key: str) -> bool:
         now = self._clock()
+        while self._buckets:
+            _, (_, oldest) = next(iter(self._buckets.items()))
+            if (now - oldest).total_seconds() < 60:
+                break
+            self._buckets.popitem(last=False)
+        if key not in self._buckets and len(self._buckets) >= self._max_keys:
+            return False
         tokens, updated = self._buckets.get(key, (self._limit, now))
         tokens = min(
             self._limit,
-            tokens + (now - updated).total_seconds() * self._limit / 60.0,
+            tokens + max(0.0, (now - updated).total_seconds()) * self._limit / 60.0,
         )
         allowed = tokens >= 1.0
         self._buckets[key] = (tokens - 1.0 if allowed else tokens, now)
+        self._buckets.move_to_end(key)
         return allowed
 
 
@@ -131,6 +154,11 @@ class WorkerPoolService:
         default_lease_seconds: int = 1200,
         max_verify_bytes: int = 256 * 1024 * 1024,
         grant_ttl_seconds: int = 900,
+        enrollments: Mapping[str, WorkerEnrollment] | None = None,
+        pre_auth_limit_per_minute: int = 1200,
+        per_source_limit_per_minute: int = 120,
+        auth_audit_limit_per_minute: int = 30,
+        max_auth_concurrency: int = 16,
     ) -> None:
         self._jobs = jobs
         self._assets = assets
@@ -145,6 +173,14 @@ class WorkerPoolService:
         self._grant_ttl_seconds = grant_ttl_seconds
         self._worker_limiter = RateLimiter(per_worker_limit_per_minute, clock)
         self._global_limiter = RateLimiter(global_limit_per_minute, clock)
+        self._enrollments = validate_enrollments(enrollments)
+        self._pre_auth_limiter = RateLimiter(pre_auth_limit_per_minute, clock, max_keys=1)
+        self._source_limiter = RateLimiter(per_source_limit_per_minute, clock)
+        self._auth_audit_limiter = RateLimiter(auth_audit_limit_per_minute, clock, max_keys=1)
+        if max_auth_concurrency < 1:
+            raise ValueError("authentication concurrency must be positive")
+        self._max_auth_concurrency = max_auth_concurrency
+        self._active_auth = 0
 
     async def submit(self, submission: JobSubmission) -> JobRecord:
         """Insert the job, or replay the record an equal submission created."""
@@ -256,32 +292,90 @@ class WorkerPoolService:
     async def audit_for_job(self, job_id: str) -> tuple[AuditEvent, ...]:
         return await self._audit.list_for_job(job_id)
 
-    async def authenticate(self, authorization: str | None) -> WorkerIdentity:
+    async def enroll_worker(
+        self, worker_id: str, enrollment: WorkerEnrollment
+    ) -> WorkerRecord:
+        """Host/admin-only admission. Never expose this as a worker endpoint.
+
+        Enrollment is idempotent but not an identity/tenant rotation API. Existing
+        bindings cannot be changed with this method or a worker heartbeat.
+        """
+        validate_enrollments({worker_id: enrollment})
+        existing = await self._registry.get(worker_id)
+        if existing is not None:
+            if existing.identity_subject != enrollment.identity_subject:
+                raise WorkerIdentityMismatch(worker_id)
+            if existing.tenant_id != enrollment.tenant_id:
+                raise WorkerTenantMismatch(worker_id)
+            return existing
+        return await self._registry.upsert(
+            WorkerRegistration(worker_id=worker_id, capabilities=(), tenant_id=enrollment.tenant_id),
+            identity_subject=enrollment.identity_subject,
+        )
+
+    async def _approved_enrollment(self, identity: WorkerIdentity) -> WorkerEnrollment:
+        record = await self._registry.get(identity.worker_id)
+        if record is not None:
+            if record.identity_subject != identity.subject:
+                raise WorkerIdentityMismatch(identity.worker_id)
+            if record.status is WorkerStatus.REVOKED:
+                raise WorkerRevoked(identity.worker_id)
+            return WorkerEnrollment(record.identity_subject, record.tenant_id)
+        enrollment = self._enrollments.get(identity.worker_id)
+        if enrollment is None or enrollment.identity_subject != identity.subject:
+            raise WorkerAuthError("worker has no approved enrollment")
+        return enrollment
+
+    async def _audit_auth(self, event_type: AuditEventType, *, worker_id: str | None = None) -> None:
+        # A shared, bounded sampling budget also covers rate-limit rejections.
+        if self._auth_audit_limiter.allow(GLOBAL_RATE_LIMIT_KEY):
+            await self._audit.record(
+                event_type, worker_id=worker_id,
+                detail={"reason": "invalid_credential" if event_type is AuditEventType.AUTH_REJECTED else "admission_rejected"},
+            )
+
+    async def authenticate(
+        self, authorization: str | None, *, source: str = "direct-service-call"
+    ) -> WorkerIdentity:
+        # No external verification or database access before admission. The
+        # source must come from ASGI/trusted ingress, never an arbitrary header.
+        if (
+            not self._source_limiter.allow(source)
+            or not self._pre_auth_limiter.allow(GLOBAL_RATE_LIMIT_KEY)
+            or self._active_auth >= self._max_auth_concurrency
+        ):
+            # No per-request audit write on this hot rejection path.
+            raise RateLimited("pre-authentication admission limit")
+        if authorization is None or len(authorization) > 8192:
+            await self._audit_auth(AuditEventType.AUTH_REJECTED)
+            raise WorkerAuthError("missing or oversized credential")
+        self._active_auth += 1
         try:
             identity = await self._authenticator.authenticate(authorization)
+            await self._approved_enrollment(identity)
+            if not self._worker_limiter.allow(identity.worker_id) or not self._global_limiter.allow(
+                GLOBAL_RATE_LIMIT_KEY
+            ):
+                await self._audit_auth(AuditEventType.RATE_LIMITED, worker_id=identity.worker_id)
+                raise RateLimited(identity.worker_id)
+            return identity
+        except WorkerAuthBusy as exc:
+            raise RateLimited("identity verification is busy") from exc
         except WorkerAuthError:
-            await self._audit.record(
-                AuditEventType.AUTH_REJECTED,
-                detail={"reason": "invalid_credential"},
-            )
+            await self._audit_auth(AuditEventType.AUTH_REJECTED)
             raise
-        if not self._worker_limiter.allow(
-            identity.worker_id
-        ) or not self._global_limiter.allow(GLOBAL_RATE_LIMIT_KEY):
-            await self._audit.record(
-                AuditEventType.RATE_LIMITED, worker_id=identity.worker_id
-            )
-            raise RateLimited(identity.worker_id)
-        record = await self._registry.get(identity.worker_id)
-        if record is not None and record.status is WorkerStatus.REVOKED:
-            raise WorkerRevoked(identity.worker_id)
-        return identity
+        finally:
+            self._active_auth -= 1
 
     async def register_heartbeat(
         self, identity: WorkerIdentity, registration: WorkerRegistration
     ) -> WorkerRecord:
         if registration.worker_id != identity.worker_id:
             raise WorkerMismatch(registration.worker_id)
+        enrollment = await self._approved_enrollment(identity)
+        if registration.tenant_id != enrollment.tenant_id:
+            raise WorkerTenantMismatch(registration.worker_id)
+        registration = replace(registration, tenant_id=enrollment.tenant_id)
         for capability in registration.capabilities:
             validate_capability_id(capability.capability_id)
         try:
@@ -306,6 +400,7 @@ class WorkerPoolService:
         capability_ids: tuple[str, ...],
         lease_seconds: int | None = None,
     ) -> LeaseGrant | None:
+        await self._approved_enrollment(identity)
         worker = await self._registry.get(identity.worker_id)
         if worker is None:
             raise WorkerNotRegistered(identity.worker_id)
@@ -533,6 +628,7 @@ class WorkerPoolService:
         }
 
     async def _owned_job(self, identity: WorkerIdentity, job_id: str) -> JobRecord:
+        await self._approved_enrollment(identity)
         record = await self._jobs.get(job_id)
         if record is None:
             raise JobNotFound(job_id)

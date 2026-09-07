@@ -34,6 +34,7 @@ from outbound_gpu_worker_pool.contracts import (
     WorkerIdentity,
     WorkerRecord,
     WorkerRegistration,
+    WorkerIdentityMismatch,
     WorkerStatus,
     WorkerTenantMismatch,
 )
@@ -369,6 +370,8 @@ class MemoryWorkerRegistry:
         now = datetime.now(UTC)
         status = WorkerStatus.DRAINING if registration.draining else WorkerStatus.ACTIVE
         existing = self.workers.get(registration.worker_id)
+        if existing is not None and existing.identity_subject != identity_subject:
+            raise WorkerIdentityMismatch(registration.worker_id)
         if existing is not None and existing.tenant_id != registration.tenant_id:
             raise WorkerTenantMismatch(registration.worker_id)
         if existing is not None and existing.status is WorkerStatus.REVOKED:

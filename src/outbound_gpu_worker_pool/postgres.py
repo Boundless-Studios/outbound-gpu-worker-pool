@@ -34,6 +34,7 @@ from outbound_gpu_worker_pool.contracts import (
     WorkerCapability,
     WorkerRecord,
     WorkerRegistration,
+    WorkerIdentityMismatch,
     WorkerStatus,
     WorkerTenantMismatch,
 )
@@ -372,7 +373,6 @@ class PostgresWorkerRegistry(_PoolOwner):
                     VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7::jsonb, $8, $9::jsonb,
                             $10, now(), now(), $11::jsonb, $12::uuid, $13)
                     ON CONFLICT (worker_id) DO UPDATE SET
-                        identity_subject = EXCLUDED.identity_subject,
                         status = CASE
                             WHEN {POOL_WORKERS_TABLE}.status = 'revoked' THEN 'revoked'
                             ELSE EXCLUDED.status
@@ -390,6 +390,7 @@ class PostgresWorkerRegistry(_PoolOwner):
                         busy_job_id = EXCLUDED.busy_job_id
                     WHERE {POOL_WORKERS_TABLE}.tenant_id
                           IS NOT DISTINCT FROM EXCLUDED.tenant_id
+                      AND {POOL_WORKERS_TABLE}.identity_subject = EXCLUDED.identity_subject
                     RETURNING *
                     """,
                     registration.worker_id,
@@ -409,7 +410,10 @@ class PostgresWorkerRegistry(_PoolOwner):
             except asyncpg.UniqueViolationError as exc:
                 raise IdentitySubjectTaken(identity_subject) from exc
         if row is None:
-            # The upsert's WHERE held the row back: its tenant is not this one.
+            # The atomic conflict predicate, not this diagnostic read, fences writes.
+            existing = await self.get(registration.worker_id)
+            if existing is None or existing.identity_subject != identity_subject:
+                raise WorkerIdentityMismatch(registration.worker_id)
             raise WorkerTenantMismatch(registration.worker_id)
         return _worker_record(row)
 
