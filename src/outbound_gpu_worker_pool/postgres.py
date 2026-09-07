@@ -26,6 +26,7 @@ from outbound_gpu_worker_pool.contracts import (
     JobFailureCode,
     JobPayloadValue,
     JobRecord,
+    JobRequirements,
     JobStatus,
     JobSubmission,
     QueueDepth,
@@ -34,6 +35,7 @@ from outbound_gpu_worker_pool.contracts import (
     WorkerRecord,
     WorkerRegistration,
     WorkerStatus,
+    WorkerTenantMismatch,
 )
 from outbound_gpu_worker_pool.validation import (
     job_request_digest,
@@ -45,7 +47,11 @@ POOL_WORKERS_TABLE = "pool_workers"
 POOL_AUDIT_EVENTS_TABLE = "pool_audit_events"
 
 MIGRATIONS_PACKAGE = "outbound_gpu_worker_pool.migrations"
-MIGRATION_FILES = ("001_worker_pool.sql", "002_worker_telemetry.sql")
+MIGRATION_FILES = (
+    "001_worker_pool.sql",
+    "002_worker_telemetry.sql",
+    "003_worker_tenancy.sql",
+)
 MIGRATION_ADVISORY_LOCK_KEY = "outbound_gpu_worker_pool.migrations"
 
 
@@ -103,10 +109,11 @@ class PostgresJobStore(_PoolOwner):
                 INSERT INTO {POOL_JOBS_TABLE} (
                     job_id, idempotency_key, capability_id, contract_version,
                     input_keys, output_key, payload, tenant_id, priority,
-                    attempt_budget, execution_deadline_seconds, request_digest
+                    attempt_budget, execution_deadline_seconds, request_digest,
+                    requirements
                 )
                 VALUES ($1::uuid, $2, $3, $4, $5::jsonb, $6, $7::jsonb, $8, $9, $10,
-                        $11, $12)
+                        $11, $12, $13::jsonb)
                 ON CONFLICT (idempotency_key) DO UPDATE
                     SET idempotency_key = EXCLUDED.idempotency_key
                     WHERE {POOL_JOBS_TABLE}.capability_id = EXCLUDED.capability_id
@@ -115,6 +122,7 @@ class PostgresJobStore(_PoolOwner):
                       AND {POOL_JOBS_TABLE}.output_key = EXCLUDED.output_key
                       AND {POOL_JOBS_TABLE}.payload = EXCLUDED.payload
                       AND {POOL_JOBS_TABLE}.tenant_id IS NOT DISTINCT FROM EXCLUDED.tenant_id
+                      AND {POOL_JOBS_TABLE}.requirements = EXCLUDED.requirements
                       AND {POOL_JOBS_TABLE}.priority = EXCLUDED.priority
                       AND {POOL_JOBS_TABLE}.attempt_budget = EXCLUDED.attempt_budget
                       AND {POOL_JOBS_TABLE}.execution_deadline_seconds
@@ -133,6 +141,7 @@ class PostgresJobStore(_PoolOwner):
                 submission.attempt_budget,
                 submission.execution_deadline_seconds,
                 job_request_digest(submission),
+                json.dumps(submission.requirements.as_payload()),
             )
         if row is None:
             raise IdempotencyConflict(submission.idempotency_key)
@@ -164,7 +173,15 @@ class PostgresJobStore(_PoolOwner):
         )
 
     async def lease(
-        self, *, worker_id: str, capability_ids: tuple[str, ...], lease_seconds: int
+        self,
+        *,
+        worker_id: str,
+        capability_ids: tuple[str, ...],
+        lease_seconds: int,
+        tenant_id: str | None = None,
+        vram_mb: int | None = None,
+        gpu_model: str | None = None,
+        labels: tuple[str, ...] = (),
     ) -> JobRecord | None:
         token = uuid4().hex
         async with self._require_pool().acquire() as connection:
@@ -176,6 +193,20 @@ class PostgresJobStore(_PoolOwner):
                       AND attempts < attempt_budget
                       AND (status = 'queued'
                            OR (status = 'processing' AND lease_until < now()))
+                      AND tenant_id IS NOT DISTINCT FROM $5
+                      AND COALESCE((requirements->>'min_vram_mb')::int, 0)
+                          <= COALESCE($6::int, 0)
+                      AND (
+                          jsonb_array_length(
+                              COALESCE(requirements->'gpu_models', '[]'::jsonb)
+                          ) = 0
+                          OR lower($7::text) IN (
+                              SELECT lower(model) FROM jsonb_array_elements_text(
+                                  requirements->'gpu_models'
+                              ) AS model
+                          )
+                      )
+                      AND COALESCE(requirements->'labels', '[]'::jsonb) <@ $8::jsonb
                     ORDER BY priority ASC, created_at ASC, job_id ASC
                     LIMIT 1
                     FOR UPDATE SKIP LOCKED
@@ -193,6 +224,10 @@ class PostgresJobStore(_PoolOwner):
                 token,
                 worker_id,
                 lease_seconds,
+                tenant_id,
+                vram_mb,
+                gpu_model,
+                json.dumps(list(labels)),
             )
         return _record(row) if row is not None else None
 
@@ -332,10 +367,10 @@ class PostgresWorkerRegistry(_PoolOwner):
                     INSERT INTO {POOL_WORKERS_TABLE} (
                         worker_id, identity_subject, status, capabilities, gpu_model,
                         vram_mb, runtime_versions, cost_class, labels, active_leases,
-                        last_heartbeat_at, updated_at, gpus, busy_job_id
+                        last_heartbeat_at, updated_at, gpus, busy_job_id, tenant_id
                     )
                     VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7::jsonb, $8, $9::jsonb,
-                            $10, now(), now(), $11::jsonb, $12::uuid)
+                            $10, now(), now(), $11::jsonb, $12::uuid, $13)
                     ON CONFLICT (worker_id) DO UPDATE SET
                         identity_subject = EXCLUDED.identity_subject,
                         status = CASE
@@ -353,6 +388,8 @@ class PostgresWorkerRegistry(_PoolOwner):
                         updated_at = now(),
                         gpus = EXCLUDED.gpus,
                         busy_job_id = EXCLUDED.busy_job_id
+                    WHERE {POOL_WORKERS_TABLE}.tenant_id
+                          IS NOT DISTINCT FROM EXCLUDED.tenant_id
                     RETURNING *
                     """,
                     registration.worker_id,
@@ -367,9 +404,13 @@ class PostgresWorkerRegistry(_PoolOwner):
                     registration.active_leases,
                     json.dumps([asdict(item) for item in registration.gpus]),
                     registration.busy_job_id,
+                    registration.tenant_id,
                 )
             except asyncpg.UniqueViolationError as exc:
                 raise IdentitySubjectTaken(identity_subject) from exc
+        if row is None:
+            # The upsert's WHERE held the row back: its tenant is not this one.
+            raise WorkerTenantMismatch(registration.worker_id)
         return _worker_record(row)
 
     async def get(self, worker_id: str) -> WorkerRecord | None:
@@ -391,6 +432,16 @@ class PostgresWorkerRegistry(_PoolOwner):
         async with self._require_pool().acquire() as connection:
             rows = await connection.fetch(
                 f"SELECT * FROM {POOL_WORKERS_TABLE} ORDER BY worker_id"
+            )
+        return tuple(_worker_record(row) for row in rows)
+
+    async def list_by_tenant(self, tenant_id: str | None) -> tuple[WorkerRecord, ...]:
+        async with self._require_pool().acquire() as connection:
+            rows = await connection.fetch(
+                f"""SELECT * FROM {POOL_WORKERS_TABLE}
+                    WHERE tenant_id IS NOT DISTINCT FROM $1
+                    ORDER BY worker_id""",
+                tenant_id,
             )
         return tuple(_worker_record(row) for row in rows)
 
@@ -452,6 +503,7 @@ def _record(row: Any) -> JobRecord:
         contract_version=row["contract_version"],
         payload=_json_value(row["payload"]),
         tenant_id=row["tenant_id"],
+        requirements=JobRequirements.from_payload(_json_value(row["requirements"])),
         priority=row["priority"],
         attempt_budget=row["attempt_budget"],
         execution_deadline_seconds=row["execution_deadline_seconds"],
@@ -496,6 +548,7 @@ def _worker_record(row: Any) -> WorkerRecord:
         busy_job_id=(
             str(row["busy_job_id"]) if row["busy_job_id"] is not None else None
         ),
+        tenant_id=row["tenant_id"],
     )
 
 

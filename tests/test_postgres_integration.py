@@ -24,14 +24,17 @@ from outbound_gpu_worker_pool import (
     IdempotencyConflict,
     IdentitySubjectTaken,
     JobFailureCode,
+    JobRequirements,
     JobStatus,
     JobSubmission,
     WorkerCapability,
     WorkerRegistration,
     WorkerStatus,
+    WorkerTenantMismatch,
 )
 from outbound_gpu_worker_pool.postgres import (
     POOL_JOBS_TABLE,
+    POOL_WORKERS_TABLE,
     PostgresAuditLog,
     PostgresJobStore,
     PostgresWorkerRegistry,
@@ -118,6 +121,29 @@ async def _set_created_at(
             job_id,
             offset_seconds,
         )
+
+
+async def _column_counts(fixture: PoolFixture) -> dict[tuple[str, bool], int]:
+    """Live and dropped column counts per table, inside this test's own schema."""
+    counts = {
+        (table, dropped): 0
+        for table in (POOL_JOBS_TABLE, POOL_WORKERS_TABLE)
+        for dropped in (False, True)
+    }
+    async with fixture.pool.acquire() as connection:
+        rows = await connection.fetch(
+            """SELECT c.relname AS table_name, a.attisdropped AS dropped,
+                      count(*) AS n
+               FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+               WHERE a.attrelid IN (to_regclass($1), to_regclass($2))
+                 AND a.attnum > 0
+               GROUP BY 1, 2""",
+            POOL_JOBS_TABLE,
+            POOL_WORKERS_TABLE,
+        )
+    for row in rows:
+        counts[(row["table_name"], row["dropped"])] = int(row["n"])
+    return counts
 
 
 async def test_concurrent_workers_never_share_a_lease(
@@ -640,3 +666,266 @@ async def test_queue_depth_counts_by_capability_and_status(
     assert depth.processing == 0
     assert depth.by_capability[ECHO].queued == 2
     assert depth.by_capability[OTHER].queued == 1
+
+
+async def test_a_tenanted_worker_leases_only_its_own_tenants_job(
+    pool_fixture: PoolFixture,
+) -> None:
+    mine = await _submit(pool_fixture, "mine", tenant_id="tenant-a")
+    await _submit(pool_fixture, "theirs", tenant_id="tenant-b")
+    await _submit(pool_fixture, "house")
+
+    first = await pool_fixture.jobs.lease(
+        worker_id="worker-a",
+        capability_ids=(ECHO,),
+        lease_seconds=600,
+        tenant_id="tenant-a",
+    )
+    second = await pool_fixture.jobs.lease(
+        worker_id="worker-a",
+        capability_ids=(ECHO,),
+        lease_seconds=600,
+        tenant_id="tenant-a",
+    )
+
+    assert first is not None and first.job_id == mine
+    assert second is None
+
+
+async def test_a_house_worker_leases_only_untenanted_jobs(
+    pool_fixture: PoolFixture,
+) -> None:
+    await _submit(pool_fixture, "theirs", tenant_id="tenant-b")
+    house = await _submit(pool_fixture, "house")
+
+    first = await pool_fixture.jobs.lease(
+        worker_id="worker-house", capability_ids=(ECHO,), lease_seconds=600
+    )
+    second = await pool_fixture.jobs.lease(
+        worker_id="worker-house", capability_ids=(ECHO,), lease_seconds=600
+    )
+
+    assert first is not None and first.job_id == house
+    assert second is None
+
+
+async def test_two_tenants_never_reach_each_others_jobs(
+    pool_fixture: PoolFixture,
+) -> None:
+    a_job = await _submit(pool_fixture, "a", tenant_id="tenant-a")
+    b_job = await _submit(pool_fixture, "b", tenant_id="tenant-b")
+
+    a_lease = await pool_fixture.jobs.lease(
+        worker_id="worker-a",
+        capability_ids=(ECHO,),
+        lease_seconds=600,
+        tenant_id="tenant-a",
+    )
+    b_lease = await pool_fixture.jobs.lease(
+        worker_id="worker-b",
+        capability_ids=(ECHO,),
+        lease_seconds=600,
+        tenant_id="tenant-b",
+    )
+
+    assert a_lease is not None and a_lease.job_id == a_job
+    assert b_lease is not None and b_lease.job_id == b_job
+
+
+async def test_a_job_needing_more_vram_than_the_worker_stays_queued(
+    pool_fixture: PoolFixture,
+) -> None:
+    job_id = await _submit(
+        pool_fixture, "hungry", requirements=JobRequirements(min_vram_mb=24576)
+    )
+
+    too_small = await pool_fixture.jobs.lease(
+        worker_id="worker-small",
+        capability_ids=(ECHO,),
+        lease_seconds=600,
+        vram_mb=8192,
+    )
+    unknown_vram = await pool_fixture.jobs.lease(
+        worker_id="worker-unknown", capability_ids=(ECHO,), lease_seconds=600
+    )
+    big_enough = await pool_fixture.jobs.lease(
+        worker_id="worker-big",
+        capability_ids=(ECHO,),
+        lease_seconds=600,
+        vram_mb=24576,
+    )
+
+    assert too_small is None
+    assert unknown_vram is None
+    assert big_enough is not None and big_enough.job_id == job_id
+    assert big_enough.requirements == JobRequirements(min_vram_mb=24576)
+
+
+async def test_a_gpu_model_requirement_is_any_of_and_case_insensitive(
+    pool_fixture: PoolFixture,
+) -> None:
+    job_id = await _submit(
+        pool_fixture,
+        "picky",
+        requirements=JobRequirements(gpu_models=("RTX 4090", "RTX 5090")),
+    )
+
+    wrong = await pool_fixture.jobs.lease(
+        worker_id="worker-wrong",
+        capability_ids=(ECHO,),
+        lease_seconds=600,
+        gpu_model="GTX 1080",
+    )
+    unknown = await pool_fixture.jobs.lease(
+        worker_id="worker-unknown", capability_ids=(ECHO,), lease_seconds=600
+    )
+    right = await pool_fixture.jobs.lease(
+        worker_id="worker-right",
+        capability_ids=(ECHO,),
+        lease_seconds=600,
+        gpu_model="rtx 5090",
+    )
+
+    assert wrong is None
+    assert unknown is None
+    assert right is not None and right.job_id == job_id
+
+
+async def test_a_labels_requirement_is_all_of(pool_fixture: PoolFixture) -> None:
+    job_id = await _submit(
+        pool_fixture, "labelled", requirements=JobRequirements(labels=("fast", "quiet"))
+    )
+
+    partial = await pool_fixture.jobs.lease(
+        worker_id="worker-partial",
+        capability_ids=(ECHO,),
+        lease_seconds=600,
+        labels=("fast",),
+    )
+    complete = await pool_fixture.jobs.lease(
+        worker_id="worker-complete",
+        capability_ids=(ECHO,),
+        lease_seconds=600,
+        labels=("quiet", "fast", "spare"),
+    )
+
+    assert partial is None
+    assert complete is not None and complete.job_id == job_id
+
+
+async def test_empty_requirements_match_any_worker_with_the_capability(
+    pool_fixture: PoolFixture,
+) -> None:
+    job_id = await _submit(pool_fixture, "anywhere")
+
+    lease = await pool_fixture.jobs.lease(
+        worker_id="worker-bare", capability_ids=(ECHO,), lease_seconds=600
+    )
+
+    assert lease is not None and lease.job_id == job_id
+    assert lease.requirements == JobRequirements()
+
+
+async def test_requirements_and_tenancy_compose(pool_fixture: PoolFixture) -> None:
+    await _submit(
+        pool_fixture,
+        "both",
+        tenant_id="tenant-a",
+        requirements=JobRequirements(min_vram_mb=24576),
+    )
+
+    right_tenant_small_gpu = await pool_fixture.jobs.lease(
+        worker_id="worker-a",
+        capability_ids=(ECHO,),
+        lease_seconds=600,
+        tenant_id="tenant-a",
+        vram_mb=8192,
+    )
+    big_gpu_wrong_tenant = await pool_fixture.jobs.lease(
+        worker_id="worker-b",
+        capability_ids=(ECHO,),
+        lease_seconds=600,
+        tenant_id="tenant-b",
+        vram_mb=24576,
+    )
+    both = await pool_fixture.jobs.lease(
+        worker_id="worker-c",
+        capability_ids=(ECHO,),
+        lease_seconds=600,
+        tenant_id="tenant-a",
+        vram_mb=24576,
+    )
+
+    assert right_tenant_small_gpu is None
+    assert big_gpu_wrong_tenant is None
+    assert both is not None
+
+
+async def test_a_worker_tenant_is_fixed_at_first_registration(
+    pool_fixture: PoolFixture,
+) -> None:
+    registration = WorkerRegistration(
+        worker_id="worker-a",
+        capabilities=(
+            WorkerCapability(
+                capability_id=ECHO, plugin_id="deterministic-echo", plugin_version="1"
+            ),
+        ),
+        tenant_id="tenant-a",
+    )
+    house = replace(registration, worker_id="worker-house", tenant_id=None)
+
+    enrolled = await pool_fixture.registry.upsert(
+        registration, identity_subject="a@pool.invalid"
+    )
+    await pool_fixture.registry.upsert(house, identity_subject="house@pool.invalid")
+
+    assert enrolled.tenant_id == "tenant-a"
+    with pytest.raises(WorkerTenantMismatch):
+        await pool_fixture.registry.upsert(
+            replace(registration, tenant_id="tenant-b"),
+            identity_subject="a@pool.invalid",
+        )
+    with pytest.raises(WorkerTenantMismatch):
+        await pool_fixture.registry.upsert(
+            replace(registration, tenant_id=None), identity_subject="a@pool.invalid"
+        )
+    with pytest.raises(WorkerTenantMismatch):
+        await pool_fixture.registry.upsert(
+            replace(house, tenant_id="tenant-a"), identity_subject="house@pool.invalid"
+        )
+    refreshed = await pool_fixture.registry.upsert(
+        registration, identity_subject="a@pool.invalid"
+    )
+
+    assert refreshed.tenant_id == "tenant-a"
+    assert [
+        worker.worker_id
+        for worker in await pool_fixture.registry.list_by_tenant("tenant-a")
+    ] == ["worker-a"]
+    assert [
+        worker.worker_id for worker in await pool_fixture.registry.list_by_tenant(None)
+    ] == ["worker-house"]
+    assert await pool_fixture.registry.list_by_tenant("tenant-b") == ()
+
+
+async def test_replaying_the_migrations_changes_no_column(
+    pool_fixture: PoolFixture,
+) -> None:
+    """A replay must add nothing and drop nothing.
+
+    A migration that adds a column and drops it again on every start walks the
+    table towards Postgres's 1600 column ceiling, counting dropped columns, and
+    the table stops accepting writes. Live and dropped counts both staying put
+    is the proof that this set is add-only.
+    """
+    before = await _column_counts(pool_fixture)
+
+    await pool_fixture.jobs.start()
+    await pool_fixture.jobs.start()
+
+    assert await _column_counts(pool_fixture) == before
+    assert before[(POOL_WORKERS_TABLE, False)] > 0
+    assert before[(POOL_JOBS_TABLE, False)] > 0
+    assert before[(POOL_WORKERS_TABLE, True)] == 0
+    assert before[(POOL_JOBS_TABLE, True)] == 0

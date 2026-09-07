@@ -103,6 +103,7 @@ def _heartbeat(
     draining: bool = False,
     gpus: list[dict] | None = None,
     busy_job_id: str | None = None,
+    tenant_id: str | None = None,
 ):
     response = harness.client.post(
         "/worker/v1/heartbeat",
@@ -121,6 +122,7 @@ def _heartbeat(
             "draining": draining,
             "gpus": gpus or [],
             "busy_job_id": busy_job_id,
+            "tenant_id": tenant_id,
         },
     )
     assert response.status_code == 200
@@ -280,3 +282,59 @@ def test_the_queue_route_counts_by_capability_and_status() -> None:
     assert body["processing"] == 1
     assert body["by_capability"][ECHO] == {"queued": 3, "processing": 1}
     assert body["by_capability"][OTHER] == {"queued": 2, "processing": 0}
+    # Queued work under a capability no online worker serves is queued and stuck.
+    assert body["online_workers_by_capability"] == {ECHO: 1}
+
+
+def test_a_worker_view_carries_the_tenant_that_owns_the_machine() -> None:
+    harness = _harness()
+
+    _heartbeat(harness, "token-a", "worker-a", tenant_id="tenant-a")
+    _heartbeat(harness, "token-b", "worker-b")
+
+    body = harness.client.get("/pool/workers").json()
+
+    assert {worker["worker_id"]: worker["tenant_id"] for worker in body["workers"]} == {
+        "worker-a": "tenant-a",
+        "worker-b": None,
+    }
+
+
+def test_the_worker_route_narrows_to_one_tenants_machines() -> None:
+    harness = _harness()
+    _heartbeat(harness, "token-a", "worker-a", tenant_id="tenant-a")
+    _heartbeat(harness, "token-b", "worker-b")
+
+    mine = harness.client.get("/pool/workers", params={"tenant_id": "tenant-a"}).json()
+    stranger = harness.client.get(
+        "/pool/workers", params={"tenant_id": "tenant-b"}
+    ).json()
+
+    assert [worker["worker_id"] for worker in mine["workers"]] == ["worker-a"]
+    assert stranger["workers"] == []
+
+
+def test_a_worker_cannot_change_the_tenant_it_enrolled_under() -> None:
+    harness = _harness()
+    _heartbeat(harness, "token-a", "worker-a", tenant_id="tenant-a")
+
+    response = harness.client.post(
+        "/worker/v1/heartbeat",
+        headers=_authorization("token-a"),
+        json={
+            "worker_id": "worker-a",
+            "capabilities": [
+                {
+                    "capability_id": ECHO,
+                    "plugin_id": "deterministic-echo",
+                    "plugin_version": "1",
+                    "concurrency": 1,
+                }
+            ],
+            "tenant_id": "tenant-b",
+        },
+    )
+
+    assert response.status_code == 409
+    worker = harness.client.get("/pool/workers").json()["workers"][0]
+    assert worker["tenant_id"] == "tenant-a"

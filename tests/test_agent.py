@@ -370,6 +370,7 @@ async def _harness(
                 plugins=active,
                 transfer=transfer,
                 http=http,
+                tenant_id="tenant-a",
                 workspace_root=workspace_root,
                 max_input_bytes=max_input_bytes,
                 min_poll_seconds=0.01,

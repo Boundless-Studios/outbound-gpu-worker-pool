@@ -151,6 +151,7 @@ class WorkerAgent:
         max_poll_seconds: float = 60.0,
         lease_seconds: int = 1200,
         heartbeat_interval_seconds: float = 30.0,
+        tenant_id: str | None = None,
         gpu_model: str | None = None,
         vram_mb: int | None = None,
         runtime_versions: Mapping[str, str] = MappingProxyType({}),
@@ -171,6 +172,7 @@ class WorkerAgent:
         self._max_poll_seconds = max_poll_seconds
         self._lease_seconds = lease_seconds
         self._heartbeat_interval_seconds = heartbeat_interval_seconds
+        self._tenant_id = tenant_id
         self._gpu_model = gpu_model
         self._vram_mb = vram_mb
         self._runtime_versions = dict(runtime_versions)
@@ -212,6 +214,7 @@ class WorkerAgent:
                     }
                     for capability in self._capabilities.values()
                 ],
+                "tenant_id": self._tenant_id,
                 "gpu_model": self._gpu_model,
                 "vram_mb": self._vram_mb,
                 "runtime_versions": self._runtime_versions,

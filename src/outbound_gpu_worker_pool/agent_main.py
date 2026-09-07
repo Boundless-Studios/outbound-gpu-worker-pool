@@ -120,6 +120,7 @@ def build_agent_from_env(environment: Mapping[str, str]) -> WorkerAgent:
         max_input_bytes=int(
             environment.get("OGWP_WORKER_MAX_INPUT_BYTES", DEFAULT_MAX_INPUT_BYTES)
         ),
+        tenant_id=environment.get("OGWP_WORKER_TENANT") or None,
         gpu_model=environment.get("OGWP_WORKER_GPU_MODEL"),
         vram_mb=int(vram_mb) if vram_mb else None,
     )

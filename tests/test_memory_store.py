@@ -17,6 +17,7 @@ from outbound_gpu_worker_pool import (
     IdempotencyConflict,
     IdentitySubjectTaken,
     JobFailureCode,
+    JobRequirements,
     JobStatus,
     JobSubmission,
     MemoryAssetStore,
@@ -29,6 +30,7 @@ from outbound_gpu_worker_pool import (
     WorkerIdentity,
     WorkerRegistration,
     WorkerStatus,
+    WorkerTenantMismatch,
 )
 
 ECHO = DETERMINISTIC_ECHO_CAPABILITY
@@ -529,3 +531,233 @@ async def test_authenticator_resolves_only_known_bearer_tokens() -> None:
     for authorization in (None, "token-a", "Bearer token-b"):
         with pytest.raises(WorkerAuthError):
             await authenticator.authenticate(authorization)
+
+
+async def test_a_tenanted_worker_leases_only_its_own_tenants_job() -> None:
+    store = MemoryJobStore()
+    mine = await _submit(store, "mine", tenant_id="tenant-a")
+    await _submit(store, "theirs", tenant_id="tenant-b")
+    await _submit(store, "house")
+
+    first = await store.lease(
+        worker_id="worker-a",
+        capability_ids=(ECHO,),
+        lease_seconds=600,
+        tenant_id="tenant-a",
+    )
+    second = await store.lease(
+        worker_id="worker-a",
+        capability_ids=(ECHO,),
+        lease_seconds=600,
+        tenant_id="tenant-a",
+    )
+
+    assert first is not None and first.job_id == mine
+    assert second is None
+
+
+async def test_a_house_worker_leases_only_untenanted_jobs() -> None:
+    store = MemoryJobStore()
+    await _submit(store, "theirs", tenant_id="tenant-b")
+    house = await _submit(store, "house")
+
+    first = await store.lease(
+        worker_id="worker-house", capability_ids=(ECHO,), lease_seconds=600
+    )
+    second = await store.lease(
+        worker_id="worker-house", capability_ids=(ECHO,), lease_seconds=600
+    )
+
+    assert first is not None and first.job_id == house
+    assert second is None
+
+
+async def test_two_tenants_never_reach_each_others_jobs() -> None:
+    store = MemoryJobStore()
+    a_job = await _submit(store, "a", tenant_id="tenant-a")
+    b_job = await _submit(store, "b", tenant_id="tenant-b")
+
+    a_lease = await store.lease(
+        worker_id="worker-a",
+        capability_ids=(ECHO,),
+        lease_seconds=600,
+        tenant_id="tenant-a",
+    )
+    b_lease = await store.lease(
+        worker_id="worker-b",
+        capability_ids=(ECHO,),
+        lease_seconds=600,
+        tenant_id="tenant-b",
+    )
+
+    assert a_lease is not None and a_lease.job_id == a_job
+    assert b_lease is not None and b_lease.job_id == b_job
+
+
+async def test_a_job_needing_more_vram_than_the_worker_stays_queued() -> None:
+    store = MemoryJobStore()
+    job_id = await _submit(
+        store, "hungry", requirements=JobRequirements(min_vram_mb=24576)
+    )
+
+    too_small = await store.lease(
+        worker_id="worker-small",
+        capability_ids=(ECHO,),
+        lease_seconds=600,
+        vram_mb=8192,
+    )
+    unknown_vram = await store.lease(
+        worker_id="worker-unknown", capability_ids=(ECHO,), lease_seconds=600
+    )
+    big_enough = await store.lease(
+        worker_id="worker-big",
+        capability_ids=(ECHO,),
+        lease_seconds=600,
+        vram_mb=24576,
+    )
+
+    assert too_small is None
+    assert unknown_vram is None
+    assert big_enough is not None and big_enough.job_id == job_id
+
+
+async def test_a_gpu_model_requirement_is_any_of_and_case_insensitive() -> None:
+    store = MemoryJobStore()
+    job_id = await _submit(
+        store,
+        "picky",
+        requirements=JobRequirements(gpu_models=("RTX 4090", "RTX 5090")),
+    )
+
+    wrong = await store.lease(
+        worker_id="worker-wrong",
+        capability_ids=(ECHO,),
+        lease_seconds=600,
+        gpu_model="GTX 1080",
+    )
+    unknown = await store.lease(
+        worker_id="worker-unknown", capability_ids=(ECHO,), lease_seconds=600
+    )
+    right = await store.lease(
+        worker_id="worker-right",
+        capability_ids=(ECHO,),
+        lease_seconds=600,
+        gpu_model="rtx 5090",
+    )
+
+    assert wrong is None
+    assert unknown is None
+    assert right is not None and right.job_id == job_id
+
+
+async def test_a_labels_requirement_is_all_of() -> None:
+    store = MemoryJobStore()
+    job_id = await _submit(
+        store, "labelled", requirements=JobRequirements(labels=("fast", "quiet"))
+    )
+
+    partial = await store.lease(
+        worker_id="worker-partial",
+        capability_ids=(ECHO,),
+        lease_seconds=600,
+        labels=("fast",),
+    )
+    complete = await store.lease(
+        worker_id="worker-complete",
+        capability_ids=(ECHO,),
+        lease_seconds=600,
+        labels=("quiet", "fast", "spare"),
+    )
+
+    assert partial is None
+    assert complete is not None and complete.job_id == job_id
+
+
+async def test_empty_requirements_match_any_worker_with_the_capability() -> None:
+    store = MemoryJobStore()
+    job_id = await _submit(store, "anywhere")
+
+    lease = await store.lease(
+        worker_id="worker-bare", capability_ids=(ECHO,), lease_seconds=600
+    )
+
+    assert lease is not None and lease.job_id == job_id
+    assert lease.requirements == JobRequirements()
+
+
+async def test_requirements_and_tenancy_compose() -> None:
+    store = MemoryJobStore()
+    await _submit(
+        store,
+        "both",
+        tenant_id="tenant-a",
+        requirements=JobRequirements(min_vram_mb=24576),
+    )
+
+    right_tenant_small_gpu = await store.lease(
+        worker_id="worker-a",
+        capability_ids=(ECHO,),
+        lease_seconds=600,
+        tenant_id="tenant-a",
+        vram_mb=8192,
+    )
+    big_gpu_wrong_tenant = await store.lease(
+        worker_id="worker-b",
+        capability_ids=(ECHO,),
+        lease_seconds=600,
+        tenant_id="tenant-b",
+        vram_mb=24576,
+    )
+    both = await store.lease(
+        worker_id="worker-c",
+        capability_ids=(ECHO,),
+        lease_seconds=600,
+        tenant_id="tenant-a",
+        vram_mb=24576,
+    )
+
+    assert right_tenant_small_gpu is None
+    assert big_gpu_wrong_tenant is None
+    assert both is not None
+
+
+async def test_a_worker_tenant_is_fixed_at_first_registration() -> None:
+    registry = MemoryWorkerRegistry()
+    registration = WorkerRegistration(
+        worker_id="worker-a",
+        capabilities=(
+            WorkerCapability(
+                capability_id=ECHO, plugin_id="deterministic-echo", plugin_version="1"
+            ),
+        ),
+        tenant_id="tenant-a",
+    )
+    house = replace(registration, worker_id="worker-house", tenant_id=None)
+
+    enrolled = await registry.upsert(registration, identity_subject="a@pool.invalid")
+    await registry.upsert(house, identity_subject="house@pool.invalid")
+
+    assert enrolled.tenant_id == "tenant-a"
+    with pytest.raises(WorkerTenantMismatch):
+        await registry.upsert(
+            replace(registration, tenant_id="tenant-b"),
+            identity_subject="a@pool.invalid",
+        )
+    with pytest.raises(WorkerTenantMismatch):
+        await registry.upsert(
+            replace(registration, tenant_id=None), identity_subject="a@pool.invalid"
+        )
+    with pytest.raises(WorkerTenantMismatch):
+        await registry.upsert(
+            replace(house, tenant_id="tenant-a"), identity_subject="house@pool.invalid"
+        )
+    refreshed = await registry.upsert(registration, identity_subject="a@pool.invalid")
+
+    assert refreshed.tenant_id == "tenant-a"
+    assert [
+        worker.worker_id for worker in await registry.list_by_tenant("tenant-a")
+    ] == ["worker-a"]
+    assert [worker.worker_id for worker in await registry.list_by_tenant(None)] == [
+        "worker-house"
+    ]
+    assert await registry.list_by_tenant("tenant-b") == ()

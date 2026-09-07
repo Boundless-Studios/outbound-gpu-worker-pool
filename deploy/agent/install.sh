@@ -118,8 +118,14 @@ if [ ! -f "$ENVIRONMENT_FILE" ]; then
 #OGWP_WORKER_MAX_INPUT_BYTES=2147483648
 
 # Advertised to the registry; free text and an integer, for operator reporting.
+# The GPU model and VRAM also decide which jobs this machine is eligible to lease.
 #OGWP_WORKER_GPU_MODEL=rtx-4090
 #OGWP_WORKER_VRAM_MB=24576
+
+# Whose machine this is. Set it and the worker only ever leases that tenant's
+# jobs; leave it unset and the machine joins the shared house pool. It is fixed
+# at enrollment: presenting a different one later is refused.
+#OGWP_WORKER_TENANT=
 
 # --- the local ComfyUI (comfy-workflow only) ---------------------------------
 

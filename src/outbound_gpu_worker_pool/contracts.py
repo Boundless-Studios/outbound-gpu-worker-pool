@@ -36,6 +36,10 @@ MIN_EXECUTION_DEADLINE_SECONDS = 60
 MAX_EXECUTION_DEADLINE_SECONDS = 7_200
 MAX_CAPABILITY_ID_LENGTH = 128
 MAX_WORKER_ID_LENGTH = 128
+MAX_TENANT_ID_LENGTH = 128
+MAX_JOB_REQUIREMENT_ENTRIES = 16
+MAX_REQUIREMENT_VALUE_LENGTH = 128
+MAX_REQUIREMENT_VRAM_MB = 1_000_000
 MAX_AUDIT_REASON_LENGTH = 300
 MAX_WORKER_GPUS = 16
 MAX_GPU_NAME_LENGTH = 128
@@ -65,6 +69,46 @@ class JobFailureCode(StrEnum):
 
 
 @dataclass(frozen=True)
+class JobRequirements:
+    """What a worker must offer before it may lease the job.
+
+    Empty means any worker that serves the capability. `gpu_models` is any-of and
+    matched case-insensitively against the worker's advertised model;
+    `labels` is all-of, a subset of the worker's labels.
+    """
+
+    min_vram_mb: int | None = None
+    gpu_models: tuple[str, ...] = ()
+    labels: tuple[str, ...] = ()
+
+    def as_payload(self) -> dict[str, JobPayloadValue]:
+        """The jsonb form: only the constraints actually set, so empty stays `{}`."""
+        payload: dict[str, JobPayloadValue] = {}
+        if self.min_vram_mb is not None:
+            payload["min_vram_mb"] = self.min_vram_mb
+        if self.gpu_models:
+            payload["gpu_models"] = list(self.gpu_models)
+        if self.labels:
+            payload["labels"] = list(self.labels)
+        return payload
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, JobPayloadValue]) -> "JobRequirements":
+        min_vram_mb = payload.get("min_vram_mb")
+        gpu_models = payload.get("gpu_models") or []
+        labels = payload.get("labels") or []
+        if not isinstance(gpu_models, list) or not isinstance(labels, list):
+            raise TypeError("requirements gpu_models and labels must be arrays")
+        if min_vram_mb is not None and not isinstance(min_vram_mb, int):
+            raise TypeError("requirements min_vram_mb must be an integer")
+        return cls(
+            min_vram_mb=min_vram_mb,
+            gpu_models=tuple(str(model) for model in gpu_models),
+            labels=tuple(str(label) for label in labels),
+        )
+
+
+@dataclass(frozen=True)
 class JobSubmission:
     """One unit of pool work as a host submits it."""
 
@@ -76,6 +120,7 @@ class JobSubmission:
     contract_version: int = 1
     payload: JobPayload = field(default_factory=dict)
     tenant_id: str | None = None
+    requirements: JobRequirements = field(default_factory=JobRequirements)
     priority: int = 100
     attempt_budget: int = 5
     execution_deadline_seconds: int = 1200
@@ -102,6 +147,7 @@ class JobRecord:
     contract_version: int = 1
     payload: JobPayload = field(default_factory=dict)
     tenant_id: str | None = None
+    requirements: JobRequirements = field(default_factory=JobRequirements)
     priority: int = 100
     attempt_budget: int = 5
     execution_deadline_seconds: int = 1200
@@ -172,13 +218,24 @@ class JobStore(Protocol):
         ...
 
     async def lease(
-        self, *, worker_id: str, capability_ids: tuple[str, ...], lease_seconds: int
+        self,
+        *,
+        worker_id: str,
+        capability_ids: tuple[str, ...],
+        lease_seconds: int,
+        tenant_id: str | None = None,
+        vram_mb: int | None = None,
+        gpu_model: str | None = None,
+        labels: tuple[str, ...] = (),
     ) -> JobRecord | None:
-        """Atomically lease the oldest claimable job for one of capability_ids.
+        """Atomically lease the oldest claimable job this worker may run.
 
         Ordered by priority, then creation time. A job is claimable while its
-        attempts are below its budget and it is either queued or processing with
-        an expired lease. Safe under concurrent callers.
+        attempts are below its budget, it is either queued or processing with an
+        expired lease, its capability is one of `capability_ids`, its tenant is
+        exactly the worker's (null for a house worker: there is no spillover in
+        either direction), and the worker satisfies its `JobRequirements`.
+        Safe under concurrent callers.
         """
         ...
 
@@ -287,6 +344,7 @@ class WorkerRegistration:
 
     worker_id: str
     capabilities: tuple[WorkerCapability, ...]
+    tenant_id: str | None = None
     gpu_model: str | None = None
     vram_mb: int | None = None
     runtime_versions: dict[str, str] = field(default_factory=dict)
@@ -318,6 +376,7 @@ class WorkerRecord:
     revoked_at: datetime | None = None
     gpus: tuple[GpuTelemetry, ...] = ()
     busy_job_id: str | None = None
+    tenant_id: str | None = None
 
     @property
     def capability_ids(self) -> tuple[str, ...]:
@@ -349,6 +408,7 @@ class PoolWorkerView:
     gpus: tuple[GpuTelemetry, ...]
     busy_job_id: str | None
     draining: bool
+    tenant_id: str | None
 
 
 @dataclass(frozen=True)
@@ -359,11 +419,19 @@ class CapabilityQueueDepth:
 
 @dataclass(frozen=True)
 class QueueDepth:
-    """The result of `GET /pool/queue`: bounded counts, never a job listing."""
+    """The result of `GET /pool/queue`: bounded counts, never a job listing.
+
+    `online_workers_by_capability` counts the non-revoked workers heard from
+    inside the online window that serve each capability, so a host can tell
+    "queued, waiting its turn" from "queued with nothing that can run it". It
+    counts capability only: a nonzero count does not prove a *particular* queued
+    job is leasable, because tenancy and per-job requirements narrow further.
+    """
 
     queued: int
     processing: int
     by_capability: dict[str, CapabilityQueueDepth]
+    online_workers_by_capability: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -381,6 +449,10 @@ class WorkerAuthError(PermissionError):
 
 class IdentitySubjectTaken(ValueError):
     """Another worker id is already enrolled under this identity subject."""
+
+
+class WorkerTenantMismatch(ValueError):
+    """A worker presented a tenant other than the one it enrolled under."""
 
 
 class IdempotencyConflict(ValueError):
@@ -423,7 +495,9 @@ class WorkerRegistry(Protocol):
     ) -> WorkerRecord:
         """Create or refresh the worker row; a revoked worker stays revoked.
 
-        Raises IdentitySubjectTaken when another worker id already owns the subject.
+        The tenant is fixed at first registration: raises WorkerTenantMismatch
+        when a later registration presents a different one, and
+        IdentitySubjectTaken when another worker id already owns the subject.
         """
         ...
 
@@ -434,6 +508,10 @@ class WorkerRegistry(Protocol):
         ...
 
     async def list(self) -> tuple[WorkerRecord, ...]: ...
+
+    async def list_by_tenant(self, tenant_id: str | None) -> tuple[WorkerRecord, ...]:
+        """Every worker enrolled under this tenant; `None` is the house pool."""
+        ...
 
     async def set_status(self, worker_id: str, status: WorkerStatus) -> bool: ...
 
