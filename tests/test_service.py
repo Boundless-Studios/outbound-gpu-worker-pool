@@ -29,6 +29,7 @@ from outbound_gpu_worker_pool import (
     OutputManifest,
     WorkerCapability,
     WorkerIdentity,
+    WorkerEnrollment,
     WorkerRegistration,
     WorkerStatus,
     job_request_digest,
@@ -82,6 +83,7 @@ def _harness(**options: object) -> _Harness:
         audit,
         MemoryWorkerAuthenticator({"token-a": WORKER_A}),
         ECHO_SCHEMAS,
+        enrollments={"worker-a": WorkerEnrollment("static:worker-a", None)},
         **options,  # type: ignore[arg-type]
     )
     return _Harness(

@@ -216,3 +216,15 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Worker credentials and local service-account files (examples stay trackable).
+agent.env
+agent.env.*
+.env.*
+service-account*.json
+*.service-account.json
+.local-credentials/
+!agent.env.example
+!.env.example
+!.env.*.example
+!service-account.example.json

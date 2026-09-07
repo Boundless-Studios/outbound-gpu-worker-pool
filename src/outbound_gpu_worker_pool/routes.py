@@ -5,16 +5,16 @@ so nothing a worker sends can widen the coordinator's input surface. No request 
 accepts a URL, path, command, or workflow graph; the signed grant URLs appear only
 in responses, where the coordinator itself minted them. A worker learns nothing
 about who a job belongs to: no `/worker/v1` response carries a job's `tenant_id`.
-A worker declares its own tenant on its first heartbeat and can never change it;
-the host-facing pool status routes are the only place a tenant is reported.
+A worker must match its server-approved identity and tenant on every heartbeat;
+the administrator-only pool status routes are the only place a tenant is reported.
 """
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from outbound_gpu_worker_pool.contracts import (
@@ -418,12 +418,15 @@ def create_worker_router(service: WorkerPoolService) -> APIRouter:
     router = APIRouter(prefix="/worker/v1", tags=["worker-pool"])
 
     async def worker_identity(
+        request: Request,
         authorization: Annotated[
             str | None, Header(alias="Authorization", max_length=8_192)
         ] = None,
     ) -> WorkerIdentity:
         with _mapped_errors():
-            return await service.authenticate(authorization)
+            return await service.authenticate(
+                authorization, source=request.client.host if request.client else "unknown-peer"
+            )
 
     Identity = Annotated[WorkerIdentity, Depends(worker_identity)]
 
@@ -507,18 +510,24 @@ def create_worker_router(service: WorkerPoolService) -> APIRouter:
 
 
 def create_pool_status_router(
-    service: WorkerPoolService, *, dependencies: Sequence[Any] = ()
+    service: WorkerPoolService, *, authorize_admin: Callable[..., Any]
 ) -> APIRouter:
-    """Read-only pool status for a host's own UI: `GET /pool/workers`, `GET /pool/queue`.
+    """Administrator-only pool status. No anonymous or generic-login default.
 
-    The library ships no authenticated product routes of its own — mount this
-    next to your own `/pool/jobs` routes with the same `dependencies` (a list of
-    FastAPI `Depends(...)`) your host already uses to gate them. Both routes are
-    cheap: worker status comes from the registry's already-loaded rows, and the
-    queue depth is a bounded aggregate, never a full job listing.
+    The host dependency must return literal True after checking administrator
+    authorization, or raise an HTTP error. A logged-in tenant/user object is not
+    sufficient. Tenant self-service belongs in the host's own scoped routes;
+    this router intentionally exposes no tenant-facing global metrics.
     """
+    if not callable(authorize_admin):
+        raise ValueError("pool status requires an administrator authorization dependency")
+
+    async def require_admin(authorized: Any = Depends(authorize_admin)) -> None:
+        if authorized is not True:
+            raise HTTPException(status_code=403, detail="pool administrator required")
+
     router = APIRouter(
-        prefix="/pool", tags=["pool-status"], dependencies=list(dependencies)
+        prefix="/pool", tags=["pool-status"], dependencies=[Depends(require_admin)]
     )
 
     @router.get("/workers", response_model=PoolWorkersResponse)

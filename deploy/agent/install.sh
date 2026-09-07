@@ -122,9 +122,10 @@ if [ ! -f "$ENVIRONMENT_FILE" ]; then
 #OGWP_WORKER_GPU_MODEL=rtx-4090
 #OGWP_WORKER_VRAM_MB=24576
 
-# Whose machine this is. Set it and the worker only ever leases that tenant's
-# jobs; leave it unset and the machine joins the shared house pool. It is fixed
-# at enrollment: presenting a different one later is refused.
+# Must match the coordinator's server-approved tenant for this identity.
+# Leaving this unset requires explicit house-pool approval on the coordinator.
+# A worker cannot choose membership: mismatches, including on the first
+# heartbeat, are refused. See OGWP_WORKER_ENROLLMENTS in the README.
 #OGWP_WORKER_TENANT=
 
 # --- the local ComfyUI (comfy-workflow only) ---------------------------------

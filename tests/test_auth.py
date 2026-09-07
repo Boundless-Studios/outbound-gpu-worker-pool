@@ -13,6 +13,7 @@ from outbound_gpu_worker_pool import (
     MemoryWorkerRegistry,
     WorkerAuthError,
     WorkerIdentity,
+    WorkerEnrollment,
     WorkerRegistration,
 )
 from outbound_gpu_worker_pool.auth import (
@@ -158,7 +159,7 @@ async def test_google_identity_rejects_an_unenrolled_subject() -> None:
         await authenticator.authenticate("Bearer id-token")
 
 
-async def test_auto_enroll_admits_a_worker_account_by_derived_id() -> None:
+async def test_auto_enroll_admits_only_an_explicit_full_identity() -> None:
     authenticator = GoogleIdTokenWorkerAuthenticator(
         audience=AUDIENCE,
         registry=MemoryWorkerRegistry(),
@@ -167,6 +168,7 @@ async def test_auto_enroll_admits_a_worker_account_by_derived_id() -> None:
             "email_verified": True,
         },
         auto_enroll=True,
+        enrollments={"rig-01": WorkerEnrollment("gpu-worker-rig-01@project.iam.gserviceaccount.com", None)},
     )
 
     identity = await authenticator.authenticate("Bearer id-token")
@@ -189,6 +191,7 @@ async def test_auto_enroll_still_rejects_identities_that_are_not_worker_accounts
                 "email_verified": True,
             },
             auto_enroll=True,
+        enrollments={"rig-01": WorkerEnrollment("gpu-worker-rig-01@project.iam.gserviceaccount.com", None)},
         )
         with pytest.raises(WorkerAuthError):
             await authenticator.authenticate("Bearer id-token")
@@ -208,6 +211,7 @@ async def test_auto_enroll_prefers_an_existing_registry_row() -> None:
             "email_verified": True,
         },
         auto_enroll=True,
+        enrollments={"rig-01": WorkerEnrollment("gpu-worker-rig-01@project.iam.gserviceaccount.com", None)},
     )
 
     identity = await authenticator.authenticate("Bearer id-token")

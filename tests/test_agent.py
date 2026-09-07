@@ -33,6 +33,7 @@ from outbound_gpu_worker_pool import (
     MemoryWorkerRegistry,
     WorkerCapability,
     WorkerIdentity,
+    WorkerEnrollment,
     WorkerStatus,
 )
 from outbound_gpu_worker_pool.agent import (
@@ -343,6 +344,9 @@ async def _harness(
             {CREDENTIAL: WorkerIdentity("worker-a", "static:worker-a", "static")}
         ),
         capability_schemas_from_plugins(active),
+        enrollments={"worker-a": WorkerEnrollment("static:worker-a", "tenant-a")},
+        pre_auth_limit_per_minute=100_000,
+        per_source_limit_per_minute=100_000,
         per_worker_limit_per_minute=100_000,
         global_limit_per_minute=100_000,
     )

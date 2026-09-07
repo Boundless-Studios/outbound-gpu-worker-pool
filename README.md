@@ -60,6 +60,7 @@ from outbound_gpu_worker_pool import (
     MemoryWorkerAuthenticator,
     MemoryWorkerRegistry,
     WorkerIdentity,
+    WorkerEnrollment,
 )
 from outbound_gpu_worker_pool.agent import WorkerAgent
 from outbound_gpu_worker_pool.coordinator import create_coordinator_app
@@ -85,6 +86,9 @@ async def main() -> None:
         ),
         capability_schemas_from_plugins(plugins),
     )
+
+    # A trusted host approves both the identity and the house/tenant membership.
+    await service.enroll_worker("worker-a", WorkerEnrollment("static:worker-a", None))
 
     submitted = await service.submit(
         JobSubmission(
@@ -152,16 +156,21 @@ changes no column: nothing here ever drops a column a later start recreates. Eve
 
 ### Pool status routes
 
-For a product surface that wants pool availability at a glance without polling every worker
-itself, `create_pool_status_router(service, *, dependencies=())` publishes two read-only,
-cheap routes. It carries no auth of its own — pass the same `dependencies` (a list of FastAPI
-`Depends(...)`) your host already uses to gate its own `/pool/jobs` routes, and mount it next
-to them:
+For an **administrator** surface, `create_pool_status_router(service, *, authorize_admin)`
+publishes two read-only routes. The authorization dependency is mandatory and must return
+literal `True` only for an authenticated pool administrator (or raise an HTTP error).
+Returning a logged-in user object is not sufficient. These are global administrative views,
+not tenant self-service endpoints; a `tenant_id` query parameter is a filter, not authorization.
 
 ```python
+from fastapi import Depends
 from outbound_gpu_worker_pool.routes import create_pool_status_router
 
-app.include_router(create_pool_status_router(service, dependencies=[Depends(my_auth)]))
+# current_user is the host's existing authenticated-principal dependency.
+async def authorize_pool_admin(user=Depends(current_user)) -> bool:
+    return user.is_pool_admin is True
+
+app.include_router(create_pool_status_router(service, authorize_admin=authorize_pool_admin))
 ```
 
 - **`GET /pool/workers`** — `{"workers": [{worker_id, status, last_heartbeat_at, capabilities,
@@ -183,10 +192,11 @@ app.include_router(create_pool_status_router(service, dependencies=[Depends(my_a
 A machine can belong to one tenant, so it only ever runs that tenant's work.
 
 - **`pool_workers.tenant_id` null means the house pool** — the shared machines an
-  operator runs. A worker sets its tenant on its first heartbeat
-  (`OGWP_WORKER_TENANT`, or `tenant_id` on the registration) and it is fixed from
-  then on: a later heartbeat presenting a different tenant is refused with `409`
-  and the row keeps the tenant it enrolled with.
+  operator runs. The coordinator's operator approves this membership **before**
+  the first heartbeat. `OGWP_WORKER_TENANT` is only a consistency assertion: it must
+  match the server-approved tenant, including an explicit null/house assignment.
+  An unauthorized first assignment or a later change is refused with `409`; the
+  worker cannot choose another tenant just by knowing its identifier.
 - **The rule for leasing is exact-match, both ways.** A tenanted worker leases only
   that tenant's jobs; a house worker leases only untenanted ones. There is no
   spillover and no fallback: a tenant whose machine is offline sees their jobs
@@ -213,6 +223,34 @@ VRAM still does not lease. Requirements and placement are matched in the lease
 statement itself, so an ineligible worker never sees the job at all.
 
 ## Enrolling a worker
+
+A valid credential alone does not authorize a new machine to join. First bind its worker ID,
+full identity subject, and tenant in server-controlled policy. A host can pre-enroll it through
+this **administrator-only service call** (never expose this on the worker API):
+
+```python
+from outbound_gpu_worker_pool import WorkerEnrollment
+
+await service.enroll_worker(
+    "gpu-01", WorkerEnrollment("static:gpu-01", "tenant-a")
+)
+```
+
+For a standalone coordinator, `OGWP_WORKER_ENROLLMENTS` supplies approved first-heartbeat
+bindings as JSON. An explicit `tenant_id` is required; `null` authorizes the house pool:
+
+```json
+{
+  "gpu-01": {"identity_subject": "static:gpu-01", "tenant_id": "tenant-a"},
+  "gpu-02": {"identity_subject": "gpu-worker-gpu-02@example-project.iam.gserviceaccount.com", "tenant_id": null}
+}
+```
+
+The service constructor accepts the equivalent `enrollments: Mapping[str, WorkerEnrollment]`.
+Existing registry bindings continue to work without this configuration. Both stores reject
+identity or tenant replacement atomically, including concurrent registration. Use a new worker
+ID and revoke the old one for a deliberate identity change; heartbeats are not a rotation API.
+
 
 **Static tokens** (development, or a single machine). Generate the token and its digest, keep
 the token on the worker machine only, and enroll the digest with the coordinator:
@@ -274,7 +312,12 @@ python -m outbound_gpu_worker_pool.coordinator_main
 | `OGWP_WORKER_AUTH` | `static` (default), `google_oidc` | how a worker credential is resolved; there is no `none` |
 | `OGWP_WORKER_TOKENS` | `worker-id:<sha256 hex>[,...]` | required for `static`; digests only |
 | `OGWP_WORKER_AUDIENCE` | audience string | required for `google_oidc` |
-| `OGWP_WORKER_AUTO_ENROLL` | `false` (default), `true` | with `google_oidc`, admit a verified `gpu-worker-<id>@…` account that has no registry row yet and create its row on first heartbeat; enable only when something in front of the coordinator (for example Cloud Run IAM) already decides who may call it |
+| `OGWP_WORKER_AUTO_ENROLL` | `false` (default), `true` | with `google_oidc`, allow only exact service-account identities in `OGWP_WORKER_ENROLLMENTS` to register on first heartbeat; requires a nonempty allowlist plus external IAM admission, never infers authorization from an account-name prefix |
+| `OGWP_WORKER_ENROLLMENTS` | JSON object | server-approved worker IDs, full `identity_subject`, and explicit `tenant_id`; required for new first-heartbeat admissions, not existing registry rows |
+| `OGWP_PRE_AUTH_LIMIT_PER_MINUTE` | default `1200` | process-wide admission budget before verification/database work |
+| `OGWP_PER_SOURCE_LIMIT_PER_MINUTE` | default `120` | per-ASGI-peer admission budget; consider trusted proxy/NAT topology |
+| `OGWP_AUTH_AUDIT_LIMIT_PER_MINUTE` | default `30` | shared sampling budget for authentication/rate-limit rejection audit rows |
+| `OGWP_MAX_AUTH_CONCURRENCY` | default `16` | concurrent authentication operations; overload is rejected, not queued |
 | `OGWP_CAPABILITY_PLUGINS` | comma separated, default `deterministic-echo` | the plugins whose schemas this coordinator publishes |
 | `OGWP_PORT` | default `8080` | listen port |
 
@@ -301,7 +344,7 @@ python -m outbound_gpu_worker_pool.agent_main
 | `OGWP_WORKER_CONCURRENCY` | default `1` | leases this machine advertises per capability |
 | `OGWP_WORKER_WORKSPACE` | path, default `<tmpdir>/outbound-gpu-worker` | per-job workspaces are created and deleted under here |
 | `OGWP_WORKER_MAX_INPUT_BYTES` | default `2147483648` (2 GiB) | the scratch bound: a single granted input larger than this aborts the download and releases the job |
-| `OGWP_WORKER_TENANT` | tenant id, default unset | whose machine this is; unset joins the house pool. Fixed at enrollment — see [Worker tenancy](#worker-tenancy) |
+| `OGWP_WORKER_TENANT` | tenant id, default unset | must match the server-approved tenant; unset requires explicit house-pool approval — see [Worker tenancy](#worker-tenancy) |
 | `OGWP_WORKER_GPU_MODEL` | free text | advertised to the registry; also matched against a job's `gpu_models` requirement |
 | `OGWP_WORKER_VRAM_MB` | integer | advertised to the registry; also matched against a job's `min_vram_mb` requirement |
 | `OGWP_NVIDIA_SMI` | path | overrides binary resolution for per-GPU telemetry sampling; otherwise `nvidia-smi` on `PATH`, then `/usr/lib/wsl/lib/nvidia-smi` |
@@ -442,6 +485,18 @@ would fail identically.
 
 Publication is create-once, so a retried attempt that already uploaded its artifact is a
 replay rather than an overwrite: the upload's `412` is treated as already-published.
+
+## Security and upgrades
+
+See [`SECURITY.md`](SECURITY.md) for the trust boundary, private reporting guidance, and
+secrets-handling policy, and [`docs/security-upgrade.md`](docs/security-upgrade.md) before
+upgrading an existing coordinator. This hardening release intentionally rejects unapproved
+first-heartbeat enrollment and requires explicit administrator authorization for status routes.
+
+CI scans every reachable revision and raw Git object with checksum-pinned Gitleaks on pull
+requests, pushes to `main`, and a weekly schedule. It includes public branches, tags, and retained
+PR heads; output contains finding metadata only. This does not replace GitHub push protection,
+private reporting, or credential rotation after a genuine exposure.
 
 ## Design
 

@@ -68,12 +68,15 @@ from outbound_gpu_worker_pool.contracts import (
     WorkerAuthError,
     WorkerCapability,
     WorkerIdentity,
+    WorkerIdentityMismatch,
+    WorkerAuthBusy,
     WorkerRecord,
     WorkerRegistration,
     WorkerRegistry,
     WorkerStatus,
     WorkerTenantMismatch,
 )
+from outbound_gpu_worker_pool.enrollment import WorkerEnrollment
 from outbound_gpu_worker_pool.memory import (
     MEMORY_READ_PREFIX,
     MEMORY_UPLOAD_PREFIX,
@@ -164,6 +167,9 @@ __all__ = [
     "WorkerAuthenticator",
     "WorkerCapability",
     "WorkerIdentity",
+    "WorkerEnrollment",
+    "WorkerIdentityMismatch",
+    "WorkerAuthBusy",
     "WorkerRecord",
     "WorkerRegistration",
     "WorkerRegistry",

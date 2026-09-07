@@ -28,6 +28,7 @@ from outbound_gpu_worker_pool import (
     MemoryWorkerAuthenticator,
     MemoryWorkerRegistry,
     WorkerIdentity,
+    WorkerEnrollment,
     WorkerStatus,
 )
 from outbound_gpu_worker_pool import routes as routes_module
@@ -78,6 +79,10 @@ def _harness(
         audit,
         authenticator,
         ECHO_SCHEMAS,
+        enrollments={
+            "worker-a": WorkerEnrollment("static:worker-a", "tenant-a"),
+            "worker-b": WorkerEnrollment("static:worker-b", "tenant-a"),
+        },
         **service_options,  # type: ignore[arg-type]
     )
     return _Harness(
@@ -633,7 +638,8 @@ def test_two_workers_cannot_share_one_identity_subject() -> None:
 
     response = heartbeat(harness.client, "token-c", "worker-c")
 
-    assert response.status_code == 409
+    # A second identity cannot even enter registration without approved enrollment.
+    assert response.status_code == 401
 
 
 def test_a_registration_for_another_worker_id_is_a_conflict() -> None:

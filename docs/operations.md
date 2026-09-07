@@ -43,6 +43,10 @@ installer says so when you use one.
 ## Enroll
 
 Enrollment is a coordinator-side act. The machine only ever holds its own credential.
+Before a first heartbeat, the operator must approve the full identity and tenant with
+`service.enroll_worker(...)` or `OGWP_WORKER_ENROLLMENTS`; see the README. The machine's
+`OGWP_WORKER_TENANT` must match that approved assignment, including null for the house pool.
+A bearer token or Cloud Run invoker permission alone is not tenant authorization.
 
 **Static token.** Generate the pair on the machine, keep the token here, hand the digest to
 whoever runs the coordinator:
@@ -158,10 +162,13 @@ await service.set_worker_status("gpu-01", WorkerStatus.REVOKED)
 The machine then gets `403` on every `/worker/v1` route even while holding a valid token. No
 other worker is touched.
 
-**Rotate a static token.** Generate a new token and digest, add the new digest to the
-coordinator's `OGWP_WORKER_TOKENS` alongside the old one, put the new token in `agent.env`,
-`systemctl --user restart outbound-gpu-worker`, confirm a heartbeat lands, then drop the old
-digest. Overlapping the two is what keeps the rotation from needing a maintenance window.
+**Rotate a static token.** This authenticator supports one digest per worker ID, not an
+overlapping list. Drain the worker, generate a new token and digest, replace its coordinator
+`OGWP_WORKER_TOKENS` entry, update the token in `agent.env`, restart the coordinator as needed
+and the worker, and confirm a heartbeat. Coordinate the cutover; duplicate worker-ID entries
+do not provide zero-downtime rotation. The enrolled `static:<worker-id>` subject and tenant
+stay unchanged. For a credential exposure, revoke first and explicitly re-enable only after
+the old credential can no longer authenticate.
 
 **Rotate a Google service account key.** Write the new key file, point
 `GOOGLE_APPLICATION_CREDENTIALS` at it, restart, confirm a heartbeat, then delete the old key

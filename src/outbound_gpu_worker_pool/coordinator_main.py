@@ -31,6 +31,7 @@ from outbound_gpu_worker_pool.contracts import (
     WorkerRegistry,
 )
 from outbound_gpu_worker_pool.coordinator import Startable, create_coordinator_app
+from outbound_gpu_worker_pool.enrollment import enrollments_from_json
 from outbound_gpu_worker_pool.memory import (
     MemoryAssetStore,
     MemoryAuditLog,
@@ -138,6 +139,7 @@ def build_from_env(environment: Mapping[str, str]) -> FastAPI:
             allowed_read_prefixes=read_prefixes,
             allowed_output_prefixes=output_prefixes,
         )
+    enrollments = enrollments_from_json(environment.get("OGWP_WORKER_ENROLLMENTS"))
     authenticator: WorkerAuthenticator
     if worker_auth == STATIC_AUTH_METHOD:
         authenticator = StaticTokenWorkerAuthenticator.from_env_value(
@@ -149,6 +151,7 @@ def build_from_env(environment: Mapping[str, str]) -> FastAPI:
             registry=registry,
             auto_enroll=environment.get("OGWP_WORKER_AUTO_ENROLL", "false").lower()
             == "true",
+            enrollments=enrollments,
         )
     service = WorkerPoolService(
         jobs,
@@ -160,6 +163,11 @@ def build_from_env(environment: Mapping[str, str]) -> FastAPI:
             environment.get("OGWP_CAPABILITY_PLUGINS", DETERMINISTIC_ECHO_PLUGIN_ID)
         ),
         auth_method=worker_auth,
+        enrollments=enrollments,
+        pre_auth_limit_per_minute=int(environment.get("OGWP_PRE_AUTH_LIMIT_PER_MINUTE", "1200")),
+        per_source_limit_per_minute=int(environment.get("OGWP_PER_SOURCE_LIMIT_PER_MINUTE", "120")),
+        auth_audit_limit_per_minute=int(environment.get("OGWP_AUTH_AUDIT_LIMIT_PER_MINUTE", "30")),
+        max_auth_concurrency=int(environment.get("OGWP_MAX_AUTH_CONCURRENCY", "16")),
     )
     return create_coordinator_app(service, lifecycle=lifecycle)
 

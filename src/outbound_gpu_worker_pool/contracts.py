@@ -447,6 +447,14 @@ class WorkerAuthError(PermissionError):
     """The request carried no acceptable worker credential."""
 
 
+class WorkerIdentityMismatch(WorkerAuthError):
+    """An existing worker id belongs to another full identity subject."""
+
+
+class WorkerAuthBusy(RuntimeError):
+    """The authenticator has no free verification slot; retry later."""
+
+
 class IdentitySubjectTaken(ValueError):
     """Another worker id is already enrolled under this identity subject."""
 
@@ -495,9 +503,11 @@ class WorkerRegistry(Protocol):
     ) -> WorkerRecord:
         """Create or refresh the worker row; a revoked worker stays revoked.
 
-        The tenant is fixed at first registration: raises WorkerTenantMismatch
-        when a later registration presents a different one, and
-        IdentitySubjectTaken when another worker id already owns the subject.
+        Trusted enrollment calls may create a row. Worker-facing callers must
+        authorize initial membership before using this method. Identity and
+        tenant are immutable: raises WorkerIdentityMismatch or WorkerTenantMismatch
+        on a conflicting upsert, and IdentitySubjectTaken when another worker id
+        already owns the subject. Implementations must enforce this atomically.
         """
         ...
 

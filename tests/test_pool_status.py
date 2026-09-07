@@ -25,6 +25,7 @@ from outbound_gpu_worker_pool import (
     MemoryWorkerRegistry,
     WorkerCapability,
     WorkerIdentity,
+    WorkerEnrollment,
     WorkerRegistration,
 )
 from outbound_gpu_worker_pool.plugins import (
@@ -54,7 +55,7 @@ class _Harness:
     now: list[datetime]
 
 
-def _harness(**service_options: object) -> _Harness:
+def _harness(*, worker_a_tenant: str | None = None, **service_options: object) -> _Harness:
     jobs = MemoryJobStore()
     assets = MemoryAssetStore()
     registry = MemoryWorkerRegistry()
@@ -73,12 +74,16 @@ def _harness(**service_options: object) -> _Harness:
         audit,
         authenticator,
         ECHO_SCHEMAS,
+        enrollments={
+            "worker-a": WorkerEnrollment("static:worker-a", worker_a_tenant),
+            "worker-b": WorkerEnrollment("static:worker-b", None),
+        },
         clock=lambda: now[0],
         **service_options,  # type: ignore[arg-type]
     )
     app = FastAPI()
     app.include_router(create_worker_router(service))
-    app.include_router(create_pool_status_router(service))
+    app.include_router(create_pool_status_router(service, authorize_admin=lambda: True))
     return _Harness(
         client=TestClient(app),
         jobs=jobs,
@@ -287,7 +292,7 @@ def test_the_queue_route_counts_by_capability_and_status() -> None:
 
 
 def test_a_worker_view_carries_the_tenant_that_owns_the_machine() -> None:
-    harness = _harness()
+    harness = _harness(worker_a_tenant="tenant-a")
 
     _heartbeat(harness, "token-a", "worker-a", tenant_id="tenant-a")
     _heartbeat(harness, "token-b", "worker-b")
@@ -301,7 +306,7 @@ def test_a_worker_view_carries_the_tenant_that_owns_the_machine() -> None:
 
 
 def test_the_worker_route_narrows_to_one_tenants_machines() -> None:
-    harness = _harness()
+    harness = _harness(worker_a_tenant="tenant-a")
     _heartbeat(harness, "token-a", "worker-a", tenant_id="tenant-a")
     _heartbeat(harness, "token-b", "worker-b")
 
@@ -315,7 +320,7 @@ def test_the_worker_route_narrows_to_one_tenants_machines() -> None:
 
 
 def test_a_worker_cannot_change_the_tenant_it_enrolled_under() -> None:
-    harness = _harness()
+    harness = _harness(worker_a_tenant="tenant-a")
     _heartbeat(harness, "token-a", "worker-a", tenant_id="tenant-a")
 
     response = harness.client.post(

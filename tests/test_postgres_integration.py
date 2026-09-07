@@ -929,3 +929,56 @@ async def test_replaying_the_migrations_changes_no_column(
     assert before[(POOL_JOBS_TABLE, False)] > 0
     assert before[(POOL_WORKERS_TABLE, True)] == 0
     assert before[(POOL_JOBS_TABLE, True)] == 0
+
+
+async def test_security_registry_rejects_identity_rebinding_atomically(pool_fixture: PoolFixture) -> None:
+    from outbound_gpu_worker_pool import WorkerIdentityMismatch
+
+    registration = WorkerRegistration("worker-secure", (), tenant_id="tenant-a")
+    before = await pool_fixture.registry.upsert(registration, identity_subject="original-subject")
+    results = await asyncio.gather(*(
+        pool_fixture.registry.upsert(
+            replace(registration, draining=True), identity_subject=f"other-subject-{i}"
+        ) for i in range(8)
+    ), return_exceptions=True)
+    assert all(isinstance(result, WorkerIdentityMismatch) for result in results)
+    assert await pool_fixture.registry.get(registration.worker_id) == before
+
+
+async def test_security_concurrent_first_registrations_keep_exactly_one_subject(pool_fixture: PoolFixture) -> None:
+    from outbound_gpu_worker_pool import WorkerIdentityMismatch, WorkerRecord
+
+    registration = WorkerRegistration("worker-race", (), tenant_id="tenant-a")
+    results = await asyncio.gather(*(
+        pool_fixture.registry.upsert(registration, identity_subject=f"subject-{i}")
+        for i in range(8)
+    ), return_exceptions=True)
+    winners = [result for result in results if isinstance(result, WorkerRecord)]
+    assert len(winners) == 1
+    assert sum(isinstance(result, WorkerIdentityMismatch) for result in results) == 7
+    assert await pool_fixture.registry.get(registration.worker_id) == winners[0]
+
+
+async def test_security_tenant_authorization_precedes_postgres_registration(pool_fixture: PoolFixture) -> None:
+    from outbound_gpu_worker_pool import (
+        MemoryAssetStore, MemoryWorkerAuthenticator, WorkerEnrollment, WorkerIdentity,
+    )
+    from outbound_gpu_worker_pool.plugins import DeterministicEchoPlugin, capability_schemas_from_plugins
+    from outbound_gpu_worker_pool.service import WorkerPoolService
+
+    identity = WorkerIdentity("worker-secure", "static:worker-secure", "static")
+    service = WorkerPoolService(
+        pool_fixture.jobs, MemoryAssetStore(), pool_fixture.registry, pool_fixture.audit,
+        MemoryWorkerAuthenticator({"test-credential": identity}),
+        capability_schemas_from_plugins((DeterministicEchoPlugin(),)),
+        enrollments={identity.worker_id: WorkerEnrollment(identity.subject, "tenant-a")},
+    )
+    registration = WorkerRegistration(identity.worker_id, (), tenant_id="tenant-a")
+    results = await asyncio.gather(
+        service.register_heartbeat(identity, replace(registration, tenant_id="tenant-b")),
+        service.register_heartbeat(identity, registration),
+        return_exceptions=True,
+    )
+    assert isinstance(results[0], WorkerTenantMismatch)
+    assert results[1].tenant_id == "tenant-a"
+    assert (await pool_fixture.registry.get(identity.worker_id)).tenant_id == "tenant-a"
