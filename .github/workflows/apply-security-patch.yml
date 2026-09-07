@@ -19,11 +19,16 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import base64, hashlib, os, pathlib, zlib
+          import base64, hashlib, json, os, pathlib, zlib
           pieces = sorted(pathlib.Path('.security-transfer').glob('part-*.b64'))
           if len(pieces) != 3:
               raise SystemExit('Incomplete patch transport')
           encoded = ''.join(p.read_text().strip() for p in pieces)
+          # Any transcription repair is still covered by the fixed decoded checksum.
+          repairs = json.loads(pathlib.Path('.security-transfer/READY').read_text())
+          for repair in sorted(repairs, key=lambda r: r['offset'], reverse=True):
+              at = repair['offset']
+              encoded = encoded[:at] + repair['text'] + encoded[at:]
           patch = zlib.decompress(base64.b64decode(encoded, validate=True))
           if hashlib.sha256(patch).hexdigest() != 'c721dadfe66b1fbcc4ee9a40cefd04f2548de1519618b246f82ea4728a850668':
               raise SystemExit('Patch checksum mismatch')
