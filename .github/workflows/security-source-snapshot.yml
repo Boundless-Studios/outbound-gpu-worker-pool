@@ -1,0 +1,25 @@
+name: Security source snapshot (temporary)
+on:
+  push:
+    branches: [security/fix-enrollment-and-admission]
+    paths: [.github/workflows/security-source-snapshot.yml]
+permissions: {}
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Archive the reviewed public revision without executing repository code
+        env:
+          GIT_TERMINAL_PROMPT: '0'
+        run: |
+          set -euo pipefail
+          git clone --quiet https://github.com/Boundless-Studios/outbound-gpu-worker-pool.git "$RUNNER_TEMP/source"
+          git -C "$RUNNER_TEMP/source" archive --format=zip 630ef2d1b62c965bc65436cd52bc7738959b2ca7 > "$RUNNER_TEMP/source.zip"
+          sha256sum "$RUNNER_TEMP/source.zip"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: reviewed-source-630ef2d
+          path: ${{ runner.temp }}/source.zip
+          retention-days: 1
+          if-no-files-found: error
