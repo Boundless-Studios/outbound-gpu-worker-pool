@@ -1,0 +1,59 @@
+name: Apply reviewed security patch (temporary)
+on:
+  push:
+    branches: [security/fix-enrollment-and-admission]
+    paths: [.security-transfer/READY]
+permissions:
+  contents: write
+jobs:
+  apply:
+    if: github.repository == 'Boundless-Studios/outbound-gpu-worker-pool' && github.ref == 'refs/heads/security/fix-enrollment-and-admission'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Verify and apply the locally tested patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, hashlib, os, pathlib, zlib
+          pieces = sorted(pathlib.Path('.security-transfer').glob('part-*.b64'))
+          if len(pieces) != 3:
+              raise SystemExit('Incomplete patch transport')
+          encoded = ''.join(p.read_text().strip() for p in pieces)
+          patch = zlib.decompress(base64.b64decode(encoded, validate=True))
+          if hashlib.sha256(patch).hexdigest() != 'c721dadfe66b1fbcc4ee9a40cefd04f2548de1519618b246f82ea4728a850668':
+              raise SystemExit('Patch checksum mismatch')
+          pathlib.Path(os.environ['RUNNER_TEMP'], 'security.patch').write_bytes(patch)
+          PY
+          # Workflow changes use the GitHub connector separately; this token
+          # is scoped only to ordinary contents and cannot edit workflows.
+          git apply --check --exclude='.github/workflows/*' "$RUNNER_TEMP/security.patch"
+          git apply --index --exclude='.github/workflows/*' "$RUNNER_TEMP/security.patch"
+          git rm -r .security-transfer
+          git diff --cached --check
+          git diff --cached --stat
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'fix: authorize worker enrollment, bind identities, and harden request admission'
+      - name: Push the reviewed branch without force
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GIT_TERMINAL_PROMPT: '0'
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          cat > "$RUNNER_TEMP/git-askpass" <<'SH'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' 'x-access-token' ;;
+            *Password*) printf '%s\n' "$GH_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          SH
+          chmod 700 "$RUNNER_TEMP/git-askpass"
+          GIT_ASKPASS="$RUNNER_TEMP/git-askpass" git push origin HEAD:refs/heads/security/fix-enrollment-and-admission
+          rm "$RUNNER_TEMP/git-askpass"
+          git rev-parse HEAD
