@@ -43,6 +43,7 @@ from outbound_gpu_worker_pool.comfy import (
 from outbound_gpu_worker_pool.plugins import ExecutionContext, PluginRequestRejected
 
 H3_CAPABILITY = "video.minimax_h3.text_to_video.v1"
+DIALOGUE_CAPABILITY = "video.minimax_h3.dialogue.v1"
 SUBJECT_CAPABILITY = "image.flux2_klein.subject.v1"
 SUBJECT_V2_CAPABILITY = "image.flux2_klein.subject.v2"
 H3_CONDITIONING_NODE = "104"
@@ -490,7 +491,12 @@ def test_the_published_schema_is_the_declared_allowlist() -> None:
 def test_capability_schemas_publish_one_entry_per_template() -> None:
     schemas = capability_schemas(_packaged())
 
-    assert set(schemas) == {H3_CAPABILITY, SUBJECT_CAPABILITY, SUBJECT_V2_CAPABILITY}
+    assert set(schemas) == {
+        H3_CAPABILITY,
+        DIALOGUE_CAPABILITY,
+        SUBJECT_CAPABILITY,
+        SUBJECT_V2_CAPABILITY,
+    }
     assert schemas[H3_CAPABILITY].contract_version == 1
     assert schemas[H3_CAPABILITY].input_schema["additionalProperties"] is False
     assert schemas[SUBJECT_CAPABILITY].input_schema["required"] == ["prompt"]
@@ -509,11 +515,13 @@ async def test_the_manifest_advertises_every_installed_template() -> None:
     assert [capability.capability_id for capability in manifest.capabilities] == [
         SUBJECT_CAPABILITY,
         SUBJECT_V2_CAPABILITY,
+        DIALOGUE_CAPABILITY,
         H3_CAPABILITY,
     ]
     assert [schema.capability_id for schema in manifest.schemas] == [
         SUBJECT_CAPABILITY,
         SUBJECT_V2_CAPABILITY,
+        DIALOGUE_CAPABILITY,
         H3_CAPABILITY,
     ]
 

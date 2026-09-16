@@ -54,6 +54,9 @@ TEMPLATE_SUFFIX = ".template.json"
 LOAD_IMAGE_CLASS_TYPE = "LoadImage"
 IMAGES_INPUT_NAME = "images"
 IMAGE_NODE_INPUT_NAME = "image"
+LOAD_AUDIO_CLASS_TYPE = "LoadAudio"
+AUDIOS_INPUT_NAME = "audios"
+AUDIO_NODE_INPUT_NAME = "audio"
 SEED_INPUT_NAME = "seed"
 FILENAME_PREFIX_INPUT_NAME = "filename_prefix"
 OUTPUT_DIRECTORY = "output"
@@ -123,6 +126,9 @@ class ComfyTemplate:
     output_content_type: str
     model_id: str
     model_version: str
+    # `LoadAudio` nodes a job may bind granted audio assets to — a character's
+    # fixed voice reference for a dialogue template. Same slot semantics as images.
+    audio_slots: tuple[ImageSlot, ...] = ()
 
 
 class TemplateRegistry:
@@ -187,6 +193,17 @@ def input_schema(template: ComfyTemplate) -> dict[str, JobPayloadValue]:
     }
     if any(slot.required for slot in template.image_slots):
         required.append(IMAGES_INPUT_NAME)
+    if template.audio_slots:
+        properties[AUDIOS_INPUT_NAME] = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                slot.name: {"type": "string"} for slot in template.audio_slots
+            },
+            "required": [slot.name for slot in template.audio_slots if slot.required],
+        }
+        if any(slot.required for slot in template.audio_slots):
+            required.append(AUDIOS_INPUT_NAME)
     return {
         "type": "object",
         "additionalProperties": False,
@@ -256,7 +273,10 @@ class ComfyWorkflowPlugin:
         if lease.contract_version != template.contract_version:
             raise PluginRequestRejected("unsupported contract version")
         declared = {entry.name: entry for entry in template.inputs}
-        if set(lease.payload) - set(declared) - {IMAGES_INPUT_NAME}:
+        media_names = {IMAGES_INPUT_NAME} | (
+            {AUDIOS_INPUT_NAME} if template.audio_slots else set()
+        )
+        if set(lease.payload) - set(declared) - media_names:
             raise PluginRequestRejected("payload carries unsupported keys")
         inputs: dict[str, JobPayloadValue] = {}
         for name, entry in declared.items():
@@ -266,7 +286,20 @@ class ComfyWorkflowPlugin:
                 raise PluginRequestRejected(f"{name} is required")
             elif entry.default is not None:
                 inputs[name] = entry.default
-        inputs[IMAGES_INPUT_NAME] = _bound_images(template, lease)
+        inputs[IMAGES_INPUT_NAME] = _bound_slots(
+            "image", template.image_slots, IMAGES_INPUT_NAME, lease
+        )
+        if template.audio_slots:
+            inputs[AUDIOS_INPUT_NAME] = _bound_slots(
+                "audio", template.audio_slots, AUDIOS_INPUT_NAME, lease
+            )
+        bound_keys: set[JobPayloadValue] = set()
+        for media_name in media_names:
+            bound = inputs.get(media_name, {})
+            assert isinstance(bound, dict)
+            bound_keys.update(bound.values())
+        if set(lease.input_keys) - bound_keys:
+            raise PluginRequestRejected("the lease granted an input no slot binds")
         seed = inputs.get(SEED_INPUT_NAME)
         return ValidatedRequest(
             capability_id=lease.capability_id,
@@ -355,6 +388,19 @@ class ComfyWorkflowPlugin:
                 _drop_slot(graph, slot)
                 continue
             _node_inputs(graph, slot.node_id)[IMAGE_NODE_INPUT_NAME] = (
+                await self._upload(context, slot.name, context.input_paths[key])
+            )
+        audios = request.inputs.get(AUDIOS_INPUT_NAME, {})
+        assert isinstance(audios, dict)
+        for slot in template.audio_slots:
+            key = audios.get(slot.name)
+            if not isinstance(key, str):
+                # Dropping the LoadAudio node also removes the reference node's
+                # link to it (its dotted autogrow key), so the model simply
+                # sees one fewer reference.
+                _drop_slot(graph, slot)
+                continue
+            _node_inputs(graph, slot.node_id)[AUDIO_NODE_INPUT_NAME] = (
                 await self._upload(context, slot.name, context.input_paths[key])
             )
         output_inputs = _node_inputs(graph, template.output_node_id)
@@ -529,14 +575,23 @@ def _template_from_document(document: dict[str, JobPayloadValue]) -> ComfyTempla
         output_content_type=document["output_content_type"],
         model_id=document["model_id"],
         model_version=document["model_version"],
+        audio_slots=tuple(
+            ImageSlot(
+                name=entry["name"],
+                node_id=entry["node_id"],
+                required=entry.get("required", False),
+                dependent_node_ids=tuple(entry.get("dependent_node_ids", ())),
+            )
+            for entry in document.get("audio_slots", ())
+        ),
     )
     _validate_template(template)
     return template
 
 
 def _validate_template(template: ComfyTemplate) -> None:
-    names: set[str] = {IMAGES_INPUT_NAME}
-    for declared in (*template.inputs, *template.image_slots):
+    names: set[str] = {IMAGES_INPUT_NAME, AUDIOS_INPUT_NAME}
+    for declared in (*template.inputs, *template.image_slots, *template.audio_slots):
         if declared.name in names:
             raise ValueError(f"two allowlist entries share the name {declared.name}")
         names.add(declared.name)
@@ -550,14 +605,17 @@ def _validate_template(template: ComfyTemplate) -> None:
             raise ValueError(
                 f"input {entry.name} declares an unknown kind: {entry.kind}"
             )
-    slot_node_ids = {slot.node_id for slot in template.image_slots}
-    for slot in template.image_slots:
+    slot_node_ids = {
+        slot.node_id for slot in (*template.image_slots, *template.audio_slots)
+    }
+    for slot, class_type, kind in (
+        *((slot, LOAD_IMAGE_CLASS_TYPE, "image") for slot in template.image_slots),
+        *((slot, LOAD_AUDIO_CLASS_TYPE, "audio") for slot in template.audio_slots),
+    ):
         node = template.graph[slot.node_id]
         assert isinstance(node, dict)
-        if node.get("class_type") != LOAD_IMAGE_CLASS_TYPE:
-            raise ValueError(
-                f"image slot {slot.name} must bind a {LOAD_IMAGE_CLASS_TYPE} node"
-            )
+        if node.get("class_type") != class_type:
+            raise ValueError(f"{kind} slot {slot.name} must bind a {class_type} node")
         for dependent_id in slot.dependent_node_ids:
             if not isinstance(template.graph.get(dependent_id), dict):
                 raise ValueError(
@@ -603,26 +661,32 @@ def _checked_value(entry: TemplateInput, value: JobPayloadValue) -> JobPayloadVa
     return value
 
 
-def _bound_images(
-    template: ComfyTemplate, lease: LeaseGrant
+def _bound_slots(
+    kind: str,
+    slots: tuple[ImageSlot, ...],
+    payload_name: str,
+    lease: LeaseGrant,
 ) -> dict[str, JobPayloadValue]:
-    requested = lease.payload.get(IMAGES_INPUT_NAME, {})
+    """The payload's slot -> granted key map for one media kind, checked."""
+    requested = lease.payload.get(payload_name, {})
     if not isinstance(requested, dict):
-        raise PluginRequestRejected("images must map a declared slot to a granted key")
-    slots = {slot.name: slot for slot in template.image_slots}
-    if set(requested) - set(slots):
-        raise PluginRequestRejected("images names a slot the template does not declare")
-    for slot in template.image_slots:
+        raise PluginRequestRejected(
+            f"{payload_name} must map a declared slot to a granted key"
+        )
+    declared = {slot.name: slot for slot in slots}
+    if set(requested) - set(declared):
+        raise PluginRequestRejected(
+            f"{payload_name} names a slot the template does not declare"
+        )
+    for slot in slots:
         if slot.required and slot.name not in requested:
-            raise PluginRequestRejected(f"image slot {slot.name} is required")
-    images: dict[str, JobPayloadValue] = {}
+            raise PluginRequestRejected(f"{kind} slot {slot.name} is required")
+    bound: dict[str, JobPayloadValue] = {}
     for name, key in requested.items():
         if not isinstance(key, str) or key not in lease.input_keys:
-            raise PluginRequestRejected(f"image slot {name} must bind a granted input")
-        images[name] = key
-    if set(lease.input_keys) - set(images.values()):
-        raise PluginRequestRejected("the lease granted an input no image slot binds")
-    return images
+            raise PluginRequestRejected(f"{kind} slot {name} must bind a granted input")
+        bound[name] = key
+    return bound
 
 
 def _node_inputs(
