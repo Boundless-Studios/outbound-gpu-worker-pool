@@ -15,6 +15,7 @@ def test_every_packaged_template_loads_and_validates() -> None:
     capability_ids = {template.capability_id for template in registry.templates}
     assert {
         "video.minimax_h3.text_to_video.v1",
+        "video.minimax_h3.dialogue.v1",
         "image.flux2_klein.subject.v1",
         "image.flux2_klein.subject.v2",
     } <= capability_ids

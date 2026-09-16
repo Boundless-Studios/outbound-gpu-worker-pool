@@ -46,6 +46,7 @@ def test_a_the_comfy_plugin_is_built_from_the_packaged_templates() -> None:
     assert agent.capability_ids == (
         "image.flux2_klein.subject.v1",
         "image.flux2_klein.subject.v2",
+        "video.minimax_h3.dialogue.v1",
         "video.minimax_h3.text_to_video.v1",
     )
 
