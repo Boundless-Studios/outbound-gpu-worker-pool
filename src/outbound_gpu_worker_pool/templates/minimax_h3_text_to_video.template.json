@@ -1,7 +1,7 @@
 {
   "capability_id": "video.minimax_h3.text_to_video.v1",
   "contract_version": 1,
-  "template_version": "1",
+  "template_version": "2",
   "model_id": "minimax-h3",
   "model_version": "fl2va-int8",
   "output_node_id": "92",
@@ -40,7 +40,7 @@
       "input_name": "length",
       "kind": "integer",
       "minimum": 17,
-      "maximum": 161,
+      "maximum": 362,
       "default": 56
     },
     {

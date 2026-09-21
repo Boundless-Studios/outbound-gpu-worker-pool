@@ -556,6 +556,21 @@ async def test_validate_applies_defaults_and_binds_the_granted_frame() -> None:
     assert request.seed == 0
 
 
+
+@pytest.mark.parametrize("length", [192, 243, 362])
+async def test_h3_motion_accepts_native_clock_long_clips(length: int) -> None:
+    async with _comfy(_FakeComfy()) as plugin:
+        request = plugin.validate(_lease({"prompt": PROMPT_TEXT, "length": length, "fps": 24}))
+    assert request.inputs["length"] == length
+    assert request.inputs["fps"] == 24
+
+
+async def test_h3_motion_rejects_frames_beyond_trained_range() -> None:
+    async with _comfy(_FakeComfy()) as plugin:
+        with pytest.raises(PluginRequestRejected):
+            plugin.validate(_lease({"prompt": PROMPT_TEXT, "length": 363, "fps": 24}))
+
+
 @pytest.mark.parametrize(
     ("payload", "input_keys"),
     [
@@ -679,7 +694,7 @@ async def test_execute_fills_the_graph_and_publishes_the_runtime_artifact(
     assert output.model_id == "minimax-h3"
     assert output.model_version == "fl2va-int8"
     assert output.seed == 0
-    assert output.diagnostics == {"prompt_id": PROMPT_ID, "template_version": "1"}
+    assert output.diagnostics == {"prompt_id": PROMPT_ID, "template_version": "2"}
     assert run.progress == [0, 50, 100]
     # The installed template is the operator's; a job fills a copy of it.
     template = registry.template(H3_CAPABILITY)
