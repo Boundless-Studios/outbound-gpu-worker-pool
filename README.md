@@ -343,6 +343,7 @@ python -m outbound_gpu_worker_pool.agent_main
 | `OGWP_WORKER_PLUGINS` | comma separated, default `deterministic-echo` | the plugins this machine is approved to run (`comfy-workflow` below) |
 | `OGWP_WORKER_CONCURRENCY` | default `1` | leases this machine advertises per capability |
 | `OGWP_WORKER_WORKSPACE` | path, default `<tmpdir>/outbound-gpu-worker` | per-job workspaces are created and deleted under here |
+| `OGWP_WORKER_RUNTIME_VERSIONS` | default `{}` | JSON object of declared runtime/recipe versions, checked against job requirements |
 | `OGWP_WORKER_MAX_INPUT_BYTES` | default `2147483648` (2 GiB) | the scratch bound: a single granted input larger than this aborts the download and releases the job |
 | `OGWP_WORKER_TENANT` | tenant id, default unset | must match the server-approved tenant; unset requires explicit house-pool approval — see [Worker tenancy](#worker-tenancy) |
 | `OGWP_WORKER_GPU_MODEL` | free text | advertised to the registry; also matched against a job's `gpu_models` requirement |
@@ -508,3 +509,17 @@ verifying, draining, upgrading, and rotating a worker machine.
 Status: alpha, slice 1 of the design's rollout — durable capability leases, the authenticated
 coordinator API, job-scoped asset grants with verified immutable outputs, and the deterministic
 reference plugin and agent.
+
+### Binding a machine recipe
+
+Hosts may set `JobRequirements.worker_ids` and `runtime_versions` to bind a job
+to an authorized worker and its declared configuration. These constraints are
+checked atomically during every lease/re-lease in both stores, in addition to
+tenant, capability and VRAM checks. Worker status includes declared runtime
+versions and VRAM for host-side discovery.
+
+`machine_profiles` provides an opt-in `h3-16gb-lightx8` recipe (8 steps,
+512×512/four requested seconds, W4A8 + LightX2V 768p, Kitchen over Sage), and
+`h3-24gb-standard` retains the standard graph. Standard template loading does
+not advertise the 16GB graph. An explicit profile checks models, nodes and runtime
+before advertising; its executor rechecks the runtime before each render.

@@ -359,6 +359,9 @@ class SettleResponse(BaseModel):
 
 
 class PoolWorkerResponse(BaseModel):
+    gpu_model: str | None = None
+    vram_mb: int | None = None
+    runtime_versions: dict[str, str] = Field(default_factory=dict)
     worker_id: str
     status: PoolWorkerStatus
     last_heartbeat_at: datetime | None
@@ -372,6 +375,9 @@ class PoolWorkerResponse(BaseModel):
     def from_view(cls, view: PoolWorkerView) -> "PoolWorkerResponse":
         return cls(
             worker_id=view.worker_id,
+            gpu_model=view.gpu_model,
+            vram_mb=view.vram_mb,
+            runtime_versions=view.runtime_versions,
             status=view.status,
             last_heartbeat_at=view.last_heartbeat_at,
             capabilities=list(view.capability_ids),

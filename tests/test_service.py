@@ -465,3 +465,21 @@ async def test_the_published_capability_schema_describes_the_echo_contract() -> 
 
     assert schema["contract_version"] == 1
     assert set(schema["input_schema"]["properties"]) == {"seed", "label"}
+
+
+@pytest.mark.parametrize('diagnostics,reason', [
+    ({}, 'recipe_configuration_mismatch'),
+    ({'runtime_versions': {'magic_recipe':'changed'}}, 'recipe_configuration_mismatch'),
+    ({'runtime_versions': {'magic_recipe':'B-v1'}, 'effective_inputs':{'seed':999}}, 'effective_inputs_mismatch'),
+])
+async def test_bound_recipe_rejects_missing_or_different_execution_attestation(diagnostics, reason):
+    from outbound_gpu_worker_pool import JobRequirements
+    harness = _harness()
+    grant = await _leased(harness)
+    record = harness.jobs.records[grant.job_id]
+    harness.jobs.records[grant.job_id] = replace(record, requirements=JobRequirements(runtime_versions={'magic_recipe':'B-v1'}))
+    await harness.assets.write_once(grant.output_key, OUTPUT_BYTES, 'text/plain')
+    with pytest.raises(CompletionRejected, match=reason):
+        await harness.service.complete(WORKER_A, grant.job_id, grant.claim_token,
+                                       _manifest(grant, OUTPUT_BYTES, diagnostics=diagnostics))
+    assert harness.jobs.records[grant.job_id].status == JobStatus.FAILED

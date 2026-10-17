@@ -63,7 +63,7 @@ Issues = "https://github.com/Boundless-Studios/outbound-gpu-worker-pool/issues"
 packages = ["src/outbound_gpu_worker_pool"]
 # The approved workflow templates are data the plugin loads at runtime, so they
 # ship inside the wheel rather than beside the source tree.
-include = ["src/outbound_gpu_worker_pool/templates/*.template.json"]
+include = ["src/outbound_gpu_worker_pool/templates/**/*.template.json"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src", "tests"]

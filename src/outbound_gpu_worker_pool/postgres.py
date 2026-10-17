@@ -25,6 +25,7 @@ from outbound_gpu_worker_pool.contracts import (
     IdentitySubjectTaken,
     JobFailureCode,
     JobPayloadValue,
+    JobPayload,
     JobRecord,
     JobRequirements,
     JobStatus,
@@ -52,6 +53,7 @@ MIGRATION_FILES = (
     "001_worker_pool.sql",
     "002_worker_telemetry.sql",
     "003_worker_tenancy.sql",
+    "004_execution_provenance.sql",
 )
 MIGRATION_ADVISORY_LOCK_KEY = "outbound_gpu_worker_pool.migrations"
 
@@ -183,6 +185,7 @@ class PostgresJobStore(_PoolOwner):
         vram_mb: int | None = None,
         gpu_model: str | None = None,
         labels: tuple[str, ...] = (),
+        runtime_versions: dict[str, str] | None = None,
     ) -> JobRecord | None:
         token = uuid4().hex
         async with self._require_pool().acquire() as connection:
@@ -208,6 +211,9 @@ class PostgresJobStore(_PoolOwner):
                           )
                       )
                       AND COALESCE(requirements->'labels', '[]'::jsonb) <@ $8::jsonb
+                      AND (COALESCE(requirements->'worker_ids', '[]'::jsonb) = '[]'::jsonb
+                           OR (requirements->'worker_ids') ? $3::text)
+                      AND COALESCE(requirements->'runtime_versions', '{{}}'::jsonb) <@ $9::jsonb
                     ORDER BY priority ASC, created_at ASC, job_id ASC
                     LIMIT 1
                     FOR UPDATE SKIP LOCKED
@@ -229,6 +235,7 @@ class PostgresJobStore(_PoolOwner):
                 vram_mb,
                 gpu_model,
                 json.dumps(list(labels)),
+                json.dumps(runtime_versions or {}),
             )
         return _record(row) if row is not None else None
 
@@ -261,10 +268,11 @@ class PostgresJobStore(_PoolOwner):
         content_type: str,
         sha256: str,
         byte_length: int,
+        execution_metadata: JobPayload | None = None,
     ) -> bool:
         return await self._execute(
             f"""UPDATE {POOL_JOBS_TABLE}
-                    SET status = 'completed', output_content_type = $3,
+                    SET status = 'completed', executed_by = leased_by, execution_metadata = $6::jsonb, output_content_type = $3,
                         output_sha256 = $4, output_byte_length = $5, error = NULL,
                         claim_token = NULL, leased_by = NULL, lease_until = NULL,
                         updated_at = now()
@@ -275,6 +283,7 @@ class PostgresJobStore(_PoolOwner):
             content_type,
             sha256,
             byte_length,
+            json.dumps(execution_metadata or {}),
         )
 
     async def fail(
@@ -514,6 +523,8 @@ def _record(row: Any) -> JobRecord:
         request_digest=row["request_digest"],
         claim_token=row["claim_token"],
         leased_by=row["leased_by"],
+        executed_by=row["executed_by"],
+        execution_metadata=_json_value(row["execution_metadata"]),
         lease_until=row["lease_until"],
         output_content_type=row["output_content_type"],
         output_sha256=row["output_sha256"],

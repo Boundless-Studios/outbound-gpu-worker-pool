@@ -264,6 +264,9 @@ class WorkerPoolService:
                     busy_job_id=record.busy_job_id,
                     draining=draining,
                     tenant_id=record.tenant_id,
+                    gpu_model=record.gpu_model,
+                    vram_mb=record.vram_mb,
+                    runtime_versions=dict(record.runtime_versions),
                 )
             )
         return tuple(views)
@@ -426,6 +429,7 @@ class WorkerPoolService:
             vram_mb=worker.vram_mb,
             gpu_model=worker.gpu_model,
             labels=worker.labels,
+            runtime_versions=worker.runtime_versions,
         )
         if job is None:
             await self._audit.record(
@@ -533,6 +537,9 @@ class WorkerPoolService:
             content_type=manifest.content_type,
             sha256=manifest.sha256,
             byte_length=manifest.byte_length,
+            execution_metadata={'model_id': manifest.model_id, 'model_version': manifest.model_version,
+                                'plugin_id': manifest.plugin_id, 'plugin_version': manifest.plugin_version,
+                                'seed': manifest.seed, 'diagnostics': dict(manifest.diagnostics)},
         )
         if not accepted:
             raise StaleLease(job_id)
@@ -640,6 +647,13 @@ class WorkerPoolService:
         return record
 
     async def _verify_output(self, record: JobRecord, manifest: OutputManifest) -> None:
+        if 'magic_recipe' in record.requirements.runtime_versions:
+            reported = manifest.diagnostics.get('runtime_versions')
+            if not isinstance(reported, dict) or any(reported.get(k) != v for k, v in record.requirements.runtime_versions.items()):
+                raise CompletionRejected('recipe_configuration_mismatch')
+            effective = manifest.diagnostics.get('effective_inputs')
+            if not isinstance(effective, dict) or any(effective.get(k) != record.payload.get(k) for k in ('steps', 'width', 'height', 'length', 'fps', 'seed')):
+                raise CompletionRejected('effective_inputs_mismatch')
         if manifest.output_key != record.output_key:
             raise CompletionRejected("output_key_mismatch")
         if manifest.idempotency_key != record.idempotency_key:

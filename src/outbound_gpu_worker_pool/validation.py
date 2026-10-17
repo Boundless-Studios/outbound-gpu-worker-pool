@@ -113,6 +113,8 @@ def validate_job_requirements(requirements: JobRequirements) -> None:
     for label, values in (
         ("gpu_models", requirements.gpu_models),
         ("labels", requirements.labels),
+        ("worker_ids", requirements.worker_ids),
+        ("runtime_versions", tuple(requirements.runtime_versions) + tuple(requirements.runtime_versions.values())),
     ):
         if len(values) > MAX_JOB_REQUIREMENT_ENTRIES:
             raise ValueError(
