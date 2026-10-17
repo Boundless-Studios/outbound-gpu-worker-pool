@@ -761,3 +761,25 @@ async def test_a_worker_tenant_is_fixed_at_first_registration() -> None:
         "worker-house"
     ]
     assert await registry.list_by_tenant("tenant-b") == ()
+
+
+@pytest.mark.asyncio
+async def test_recipe_and_worker_binding_survive_leasing_and_retry():
+    store = MemoryJobStore()
+    requirements = JobRequirements(worker_ids=('chosen',), runtime_versions={'recipe': 'B-v1'})
+    assert JobRequirements.from_payload(requirements.as_payload()) == requirements
+    job = JobSubmission(job_id=str(uuid4()), idempotency_key='recipe-bound',
+                        capability_id=DETERMINISTIC_ECHO_CAPABILITY,
+                        input_keys=(), output_key='outputs/bound', requirements=requirements)
+    await store.submit(job)
+    async def lease(worker, version):
+        return await store.lease(worker_id=worker, capability_ids=(DETERMINISTIC_ECHO_CAPABILITY,),
+                                 lease_seconds=60, runtime_versions={'recipe': version})
+    assert await lease('other', 'B-v1') is None
+    assert await lease('chosen', 'B-v2') is None
+    claimed = await lease('chosen', 'B-v1')
+    assert claimed is not None
+    store.records[claimed.job_id] = replace(claimed, lease_until=datetime.now(UTC)-timedelta(seconds=1))
+    assert await lease('other', 'B-v1') is None
+    assert await lease('chosen', 'B-v2') is None
+    assert (await lease('chosen', 'B-v1')).attempts == 2

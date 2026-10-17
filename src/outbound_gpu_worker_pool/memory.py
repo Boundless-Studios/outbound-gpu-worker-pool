@@ -25,6 +25,7 @@ from outbound_gpu_worker_pool.contracts import (
     IdentitySubjectTaken,
     JobFailureCode,
     JobPayloadValue,
+    JobPayload,
     JobRecord,
     JobStatus,
     JobSubmission,
@@ -121,6 +122,7 @@ class MemoryJobStore:
         vram_mb: int | None = None,
         gpu_model: str | None = None,
         labels: tuple[str, ...] = (),
+        runtime_versions: dict[str, str] | None = None,
     ) -> JobRecord | None:
         now = datetime.now(UTC)
         candidates = [
@@ -129,7 +131,7 @@ class MemoryJobStore:
             if record.capability_id in capability_ids
             and record.attempts < record.attempt_budget
             and record.tenant_id == tenant_id
-            and _satisfies_requirements(record, vram_mb, gpu_model, labels)
+            and _satisfies_requirements(record, vram_mb, gpu_model, labels, worker_id, runtime_versions or {})
             and _is_leasable(record, now)
         ]
         if not candidates:
@@ -181,6 +183,7 @@ class MemoryJobStore:
         content_type: str,
         sha256: str,
         byte_length: int,
+        execution_metadata: JobPayload | None = None,
     ) -> bool:
         record = self._leased(job_id, claim_token)
         if record is None:
@@ -188,6 +191,8 @@ class MemoryJobStore:
         self.records[job_id] = replace(
             _settled(record),
             status=JobStatus.COMPLETED,
+            executed_by=record.leased_by,
+            execution_metadata=dict(execution_metadata or {}),
             output_content_type=content_type,
             output_sha256=sha256,
             output_byte_length=byte_length,
@@ -505,9 +510,15 @@ def _satisfies_requirements(
     vram_mb: int | None,
     gpu_model: str | None,
     labels: tuple[str, ...],
+    worker_id: str,
+    runtime_versions: dict[str, str],
 ) -> bool:
     """The memory mirror of the Postgres requirement predicates."""
     requirements = record.requirements
+    if requirements.worker_ids and worker_id not in requirements.worker_ids:
+        return False
+    if any(runtime_versions.get(k) != v for k, v in requirements.runtime_versions.items()):
+        return False
     if (requirements.min_vram_mb or 0) > (vram_mb or 0):
         return False
     if requirements.gpu_models and (

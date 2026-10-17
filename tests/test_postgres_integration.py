@@ -982,3 +982,25 @@ async def test_security_tenant_authorization_precedes_postgres_registration(pool
     assert isinstance(results[0], WorkerTenantMismatch)
     assert results[1].tenant_id == "tenant-a"
     assert (await pool_fixture.registry.get(identity.worker_id)).tenant_id == "tenant-a"
+
+
+async def test_recipe_and_worker_requirements_are_atomic_in_postgres(pool_fixture: PoolFixture) -> None:
+    requirements = JobRequirements(worker_ids=('selected',), runtime_versions={'recipe':'B-v1'})
+    job_id = await _submit(pool_fixture, 'recipe-bound', requirements=requirements)
+    async def lease(worker_id, version):
+        return await pool_fixture.jobs.lease(worker_id=worker_id, capability_ids=(ECHO,),
+                                             lease_seconds=60, runtime_versions={'recipe':version})
+    assert await lease('other', 'B-v1') is None
+    assert await lease('selected', 'B-v2') is None
+    claimed = await lease('selected', 'B-v1')
+    assert claimed.job_id == job_id
+    assert claimed.requirements == requirements
+
+
+async def test_completed_worker_identity_is_preserved(pool_fixture: PoolFixture) -> None:
+    job_id = await _submit(pool_fixture, 'provenance')
+    claimed = await pool_fixture.jobs.lease(worker_id='selected', capability_ids=(ECHO,), lease_seconds=60)
+    assert await pool_fixture.jobs.complete(job_id, claimed.claim_token, content_type='video/mp4', sha256='a'*64, byte_length=123)
+    completed = await pool_fixture.jobs.get(job_id)
+    assert completed.executed_by == 'selected'
+    assert completed.leased_by is None

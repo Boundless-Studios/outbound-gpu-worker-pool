@@ -116,6 +116,7 @@ if [ ! -f "$ENVIRONMENT_FILE" ]; then
 # The scratch bound. One granted input larger than this aborts the download and
 # releases the job rather than filling the disk. Default 2147483648 (2 GiB).
 #OGWP_WORKER_MAX_INPUT_BYTES=2147483648
+#OGWP_WORKER_RUNTIME_VERSIONS={}
 
 # Advertised to the registry; free text and an integer, for operator reporting.
 # The GPU model and VRAM also decide which jobs this machine is eligible to lease.

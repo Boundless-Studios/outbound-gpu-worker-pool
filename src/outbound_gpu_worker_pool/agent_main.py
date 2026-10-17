@@ -7,6 +7,7 @@ access. SIGTERM and SIGINT drain: the in-flight job finishes, a final draining
 heartbeat is sent, and the process exits 0.
 """
 
+import json
 import asyncio
 import os
 import shlex
@@ -116,6 +117,7 @@ def build_agent_from_env(environment: Mapping[str, str]) -> WorkerAgent:
         transfer=HttpAssetTransfer(httpx.AsyncClient(timeout=TRANSFER_TIMEOUT_SECONDS)),
         http=httpx.AsyncClient(timeout=COORDINATOR_TIMEOUT_SECONDS),
         workspace_root=workspace_root,
+        runtime_versions=json.loads(environment.get("OGWP_WORKER_RUNTIME_VERSIONS", "{}")),
         concurrency=int(environment.get("OGWP_WORKER_CONCURRENCY", "1")),
         max_input_bytes=int(
             environment.get("OGWP_WORKER_MAX_INPUT_BYTES", DEFAULT_MAX_INPUT_BYTES)

@@ -80,6 +80,8 @@ class JobRequirements:
     min_vram_mb: int | None = None
     gpu_models: tuple[str, ...] = ()
     labels: tuple[str, ...] = ()
+    worker_ids: tuple[str, ...] = ()
+    runtime_versions: dict[str, str] = field(default_factory=dict)
 
     def as_payload(self) -> dict[str, JobPayloadValue]:
         """The jsonb form: only the constraints actually set, so empty stays `{}`."""
@@ -90,6 +92,10 @@ class JobRequirements:
             payload["gpu_models"] = list(self.gpu_models)
         if self.labels:
             payload["labels"] = list(self.labels)
+        if self.worker_ids:
+            payload["worker_ids"] = list(self.worker_ids)
+        if self.runtime_versions:
+            payload["runtime_versions"] = dict(self.runtime_versions)
         return payload
 
     @classmethod
@@ -101,7 +107,15 @@ class JobRequirements:
             raise TypeError("requirements gpu_models and labels must be arrays")
         if min_vram_mb is not None and not isinstance(min_vram_mb, int):
             raise TypeError("requirements min_vram_mb must be an integer")
+        worker_ids = payload.get("worker_ids") or []
+        versions = payload.get("runtime_versions") or {}
+        if not isinstance(worker_ids, list) or not all(isinstance(v, str) for v in worker_ids):
+            raise TypeError("requirements worker_ids must be an array of strings")
+        if not isinstance(versions, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in versions.items()):
+            raise TypeError("requirements runtime_versions must map strings to strings")
         return cls(
+            worker_ids=tuple(worker_ids),
+            runtime_versions=dict(versions),
             min_vram_mb=min_vram_mb,
             gpu_models=tuple(str(model) for model in gpu_models),
             labels=tuple(str(label) for label in labels),
@@ -154,6 +168,8 @@ class JobRecord:
     request_digest: str = ""
     claim_token: str | None = None
     leased_by: str | None = None
+    executed_by: str | None = None
+    execution_metadata: JobPayload = field(default_factory=dict)
     lease_until: datetime | None = None
     output_content_type: str | None = None
     output_sha256: str | None = None
@@ -227,6 +243,7 @@ class JobStore(Protocol):
         vram_mb: int | None = None,
         gpu_model: str | None = None,
         labels: tuple[str, ...] = (),
+        runtime_versions: Mapping[str, str] | None = None,
     ) -> JobRecord | None:
         """Atomically lease the oldest claimable job this worker may run.
 
@@ -258,6 +275,7 @@ class JobStore(Protocol):
         content_type: str,
         sha256: str,
         byte_length: int,
+        execution_metadata: JobPayload | None = None,
     ) -> bool: ...
 
     async def fail(
@@ -409,6 +427,9 @@ class PoolWorkerView:
     busy_job_id: str | None
     draining: bool
     tenant_id: str | None
+    gpu_model: str | None = None
+    vram_mb: int | None = None
+    runtime_versions: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
