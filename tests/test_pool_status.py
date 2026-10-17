@@ -343,3 +343,11 @@ def test_a_worker_cannot_change_the_tenant_it_enrolled_under() -> None:
     assert response.status_code == 409
     worker = harness.client.get("/pool/workers").json()["workers"][0]
     assert worker["tenant_id"] == "tenant-a"
+
+
+def test_revoked_workers_are_not_available_in_discovery():
+    from outbound_gpu_worker_pool import WorkerStatus
+    harness = _harness()
+    _heartbeat(harness, 'token-a', 'worker-a')
+    asyncio.run(harness.registry.set_status('worker-a', WorkerStatus.REVOKED))
+    assert harness.client.get('/pool/workers').json()['workers'] == []

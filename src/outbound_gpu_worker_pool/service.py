@@ -240,7 +240,7 @@ class WorkerPoolService:
             else await self._registry.list_by_tenant(tenant_id)
         )
         for record in records:
-            if record.last_heartbeat_at is None:
+            if record.status is WorkerStatus.REVOKED or record.last_heartbeat_at is None:
                 continue
             age_seconds = (now - record.last_heartbeat_at).total_seconds()
             if age_seconds > visibility_window_seconds:
