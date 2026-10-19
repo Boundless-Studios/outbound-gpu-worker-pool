@@ -50,11 +50,13 @@ H3_CONDITIONING_NODE = "104"
 H3_SEED_NODE = "15"
 H3_SCHEDULER_NODE = "9"
 H3_FIRST_FRAME_NODE = "200"
+H3_LAST_FRAME_NODE = "201"
 H3_OUTPUT_NODE = "92"
 JOB_ID = "job-1"
 PROMPT_ID = "prompt-1"
 PROMPT_TEXT = "a paper lantern drifting over still water"
 FRAME_KEY = "inputs/pool/frame.png"
+LAST_FRAME_KEY = "inputs/pool/last-frame.png"
 OUTPUT_KEY = "outputs/pool/clip.mp4"
 VIEW_BODY = b"mp4-bytes"
 UPLOAD_FILENAME = re.compile(rb'name="image"; filename="([^"]+)"')
@@ -317,9 +319,14 @@ def test_the_packaged_directory_ships_the_approved_h3_template() -> None:
         "seed",
         "fps",
     ]
-    assert [slot.name for slot in template.image_slots] == ["first_frame"]
+    assert [slot.name for slot in template.image_slots] == ["first_frame", "last_frame"]
+    assert all(not slot.required for slot in template.image_slots)
     assert template.graph[H3_FIRST_FRAME_NODE]["class_type"] == "LoadImage"
-    assert template.graph[H3_CONDITIONING_NODE]["class_type"] == "MiniMaxH3ImageToVideo"
+    assert template.graph[H3_LAST_FRAME_NODE]["class_type"] == "LoadImage"
+    conditioning = template.graph[H3_CONDITIONING_NODE]
+    assert conditioning["class_type"] == "MiniMaxH3ImageToVideo"
+    assert conditioning["inputs"]["first_frame"] == [H3_FIRST_FRAME_NODE, 0]
+    assert conditioning["inputs"]["last_frame"] == [H3_LAST_FRAME_NODE, 0]
 
 
 @pytest.mark.parametrize(
@@ -481,10 +488,13 @@ def test_the_published_schema_is_the_declared_allowlist() -> None:
     assert schema["properties"]["images"] == {
         "type": "object",
         "additionalProperties": False,
-        "properties": {"first_frame": {"type": "string"}},
+        "properties": {
+            "first_frame": {"type": "string"},
+            "last_frame": {"type": "string"},
+        },
         "required": [],
     }
-    # `first_frame` is optional, so only the required inputs are named.
+    # Both frames are optional, so only the required inputs are named.
     assert schema["required"] == ["prompt"]
 
 
@@ -589,7 +599,7 @@ async def test_h3_motion_rejects_frames_beyond_trained_range() -> None:
             id="slot-bound-to-a-key-the-lease-never-granted",
         ),
         pytest.param(
-            {"prompt": PROMPT_TEXT, "images": {"last_frame": FRAME_KEY}},
+            {"prompt": PROMPT_TEXT, "images": {"middle_frame": FRAME_KEY}},
             (FRAME_KEY,),
             id="undeclared-slot",
         ),
@@ -694,7 +704,7 @@ async def test_execute_fills_the_graph_and_publishes_the_runtime_artifact(
     assert output.model_id == "minimax-h3"
     assert output.model_version == "fl2va-int8"
     assert output.seed == 0
-    assert output.diagnostics == {"prompt_id": PROMPT_ID, "template_version": "2"}
+    assert output.diagnostics == {"prompt_id": PROMPT_ID, "template_version": "3"}
     assert run.progress == [0, 50, 100]
     # The installed template is the operator's; a job fills a copy of it.
     template = registry.template(H3_CAPABILITY)
@@ -716,8 +726,83 @@ async def test_an_unbound_slot_leaves_neither_its_node_nor_a_dangling_link(
 
     graph = fake.graphs[0]
     assert H3_FIRST_FRAME_NODE not in graph
+    assert H3_LAST_FRAME_NODE not in graph
     assert "first_frame" not in graph[H3_CONDITIONING_NODE]["inputs"]
+    assert "last_frame" not in graph[H3_CONDITIONING_NODE]["inputs"]
     assert fake.uploaded_names == []
+
+
+async def test_a_first_frame_only_job_submits_the_graph_it_did_before_last_frame(
+    tmp_path: Path,
+) -> None:
+    """Adding the optional last frame changes nothing for a job that omits it:
+    the submitted graph is the template minus node 201 and its one link."""
+    fake = _FakeComfy(histories=[_history(completed=True)])
+    run = _run(tmp_path, input_paths={FRAME_KEY: _frame(tmp_path)})
+    registry = _packaged()
+
+    async with _comfy(fake, registry) as plugin:
+        request = plugin.validate(
+            _lease(
+                {"prompt": PROMPT_TEXT, "images": {"first_frame": FRAME_KEY}},
+                input_keys=(FRAME_KEY,),
+            )
+        )
+        await plugin.execute(run.context, request)
+
+    template = registry.template(H3_CAPABILITY)
+    assert template is not None
+    expected = json.loads(json.dumps(template.graph))
+    del expected[H3_LAST_FRAME_NODE]
+    del expected[H3_CONDITIONING_NODE]["inputs"]["last_frame"]
+    expected[H3_FIRST_FRAME_NODE]["inputs"]["image"] = fake.stored_as
+    expected[H3_CONDITIONING_NODE]["inputs"]["prompt"] = PROMPT_TEXT
+    expected[H3_OUTPUT_NODE]["inputs"]["filename_prefix"] = f"ogwp/{JOB_ID}"
+    assert fake.graphs == [expected]
+    assert fake.uploaded_names == [f"{JOB_ID}-first_frame.png"]
+
+
+async def test_a_first_and_last_frame_job_pins_both_ends_of_the_clip(
+    tmp_path: Path,
+) -> None:
+    last = tmp_path / "inputs" / "last-frame.png"
+    last.parent.mkdir(parents=True, exist_ok=True)
+    last.write_bytes(b"last-frame-bytes")
+    fake = _FakeComfy(histories=[_history(completed=True)])
+    run = _run(
+        tmp_path, input_paths={FRAME_KEY: _frame(tmp_path), LAST_FRAME_KEY: last}
+    )
+
+    async with _comfy(fake) as plugin:
+        request = plugin.validate(
+            _lease(
+                {
+                    "prompt": PROMPT_TEXT,
+                    "width": 768,
+                    "height": 448,
+                    "length": 124,
+                    "images": {"first_frame": FRAME_KEY, "last_frame": LAST_FRAME_KEY},
+                },
+                input_keys=(FRAME_KEY, LAST_FRAME_KEY),
+            )
+        )
+        await plugin.execute(run.context, request)
+
+    graph = fake.graphs[0]
+    assert fake.uploaded_names == [
+        f"{JOB_ID}-first_frame.png",
+        f"{JOB_ID}-last_frame.png",
+    ]
+    assert graph[H3_FIRST_FRAME_NODE]["inputs"]["image"] == fake.stored_as
+    assert graph[H3_LAST_FRAME_NODE]["inputs"]["image"] == fake.stored_as
+    conditioning = graph[H3_CONDITIONING_NODE]["inputs"]
+    assert conditioning["first_frame"] == [H3_FIRST_FRAME_NODE, 0]
+    assert conditioning["last_frame"] == [H3_LAST_FRAME_NODE, 0]
+    assert (conditioning["width"], conditioning["height"], conditioning["length"]) == (
+        768,
+        448,
+        124,
+    )
 
 
 def test_dropping_a_slot_with_dependents_removes_them_and_their_links_only() -> None:

@@ -1,7 +1,7 @@
 {
   "capability_id": "video.minimax_h3.text_to_video.v1",
   "contract_version": 1,
-  "template_version": "2",
+  "template_version": "3",
   "model_id": "minimax-h3",
   "model_version": "fl2va-int8",
   "output_node_id": "92",
@@ -75,6 +75,11 @@
       "name": "first_frame",
       "node_id": "200",
       "required": false
+    },
+    {
+      "name": "last_frame",
+      "node_id": "201",
+      "required": false
     }
   ],
   "graph": {
@@ -110,6 +115,12 @@
         "image": "first_frame.png"
       }
     },
+    "201": {
+      "class_type": "LoadImage",
+      "inputs": {
+        "image": "last_frame.png"
+      }
+    },
     "104": {
       "class_type": "MiniMaxH3ImageToVideo",
       "inputs": {
@@ -119,7 +130,8 @@
         "width": 1344,
         "height": 768,
         "length": 56,
-        "first_frame": ["200", 0]
+        "first_frame": ["200", 0],
+        "last_frame": ["201", 0]
       }
     },
     "15": {
