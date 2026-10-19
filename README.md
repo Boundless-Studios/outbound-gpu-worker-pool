@@ -425,18 +425,22 @@ match a description. Each reference is optional and independent; any subset may 
 | `images.ref_3` | asset key | a granted input key | optional |
 
 `video.minimax_h3.text_to_video.v1`, model `minimax-h3` / `fl2va-int8`, contract `1`, output
-`video/mp4`.
+`video/mp4`. Both frames are optional: bind none for text-to-video, `first_frame` alone to
+start the clip on an image, or both to pin the clip's first and last frames (a frame-pinned
+camera move between two images). An unbound frame is dropped from the graph, so a job that
+sends no `last_frame` submits exactly the graph it did before the slot existed.
 
 | Input | Kind | Range | Default |
 |---|---|---|---|
 | `prompt` | string | 1–2000 characters | required |
 | `width` | integer | 256–1344 | 1344 |
 | `height` | integer | 256–1344 | 768 |
-| `length` | integer | 17–161 | 56 |
+| `length` | integer | 17–362 | 56 |
 | `steps` | integer | 4–40 | 20 |
 | `seed` | integer | ≥ 0 | 0 |
 | `fps` | integer | 8–30 | 24 |
 | `images.first_frame` | asset key | a granted input key | optional |
+| `images.last_frame` | asset key | a granted input key | optional |
 
 **The runtime is local by construction.** `OGWP_COMFY_URL` must address loopback (`127.0.0.1`,
 `localhost`, `::1`) or a private address (RFC1918, or `100.64.0.0/10` for a tailnet); the
