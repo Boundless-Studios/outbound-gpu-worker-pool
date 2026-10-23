@@ -99,6 +99,8 @@ def _run_install(
         "HOME": str(user_home),
         "XDG_CONFIG_HOME": str(user_home / ".config"),
         "OGWP_HOME": str(agent_home),
+        # The same-user installer is development-only and refuses without this.
+        "OGWP_ALLOW_UNSANDBOXED": "1",
     }
     return subprocess.run(
         [str(INSTALL_SCRIPT)],
@@ -190,6 +192,8 @@ def test_d_a_pinned_ref_is_what_gets_installed(tmp_path: Path) -> None:
         "HOME": str(user_home),
         "XDG_CONFIG_HOME": str(user_home / ".config"),
         "OGWP_HOME": str(agent_home),
+        # The same-user installer is development-only and refuses without this.
+        "OGWP_ALLOW_UNSANDBOXED": "1",
         "OGWP_REF": "0123456789abcdef",
     }
 

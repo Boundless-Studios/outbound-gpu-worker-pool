@@ -130,6 +130,10 @@ if [ ! -f "$ENVIRONMENT_FILE" ]; then
 #OGWP_WORKER_GPU_MODEL=rtx-4090
 #OGWP_WORKER_VRAM_MB=24576
 
+# Per-GPU telemetry source: nvidia-smi on this host, or comfy to read memory from the
+# local ComfyUI's /system_stats (loopback only; utilization is then reported as unknown).
+#OGWP_WORKER_GPU_TELEMETRY=nvidia-smi
+
 # Must match the coordinator's server-approved tenant for this identity.
 # Leaving this unset requires explicit house-pool approval on the coordinator.
 # A worker cannot choose membership: mismatches, including on the first
