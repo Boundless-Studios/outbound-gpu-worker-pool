@@ -168,3 +168,16 @@ def test_env_var_is_preferred_over_path_and_wsl(
     sampler = GpuSampler(env={"OGWP_NVIDIA_SMI": "/custom/nvidia-smi"})
 
     assert sampler._resolve_binary() == "/custom/nvidia-smi"
+
+
+@pytest.mark.parametrize("length,accepted", [(128, True), (129, False)])
+def test_comfy_gpu_names_respect_the_heartbeat_limit(length, accepted):
+    from outbound_gpu_worker_pool.contracts import MAX_GPU_NAME_LENGTH
+    assert MAX_GPU_NAME_LENGTH == 128
+    document = {"devices": [{"type": "cuda", "index": 0, "name": "G" * length,
+                             "vram_total": 8 * 2**30, "vram_free": 6 * 2**30}]}
+    if accepted:
+        assert _parse_comfy_stats(document)[0].name == "G" * length
+    else:
+        with pytest.raises(ValueError, match="GPU name"):
+            _parse_comfy_stats(document)

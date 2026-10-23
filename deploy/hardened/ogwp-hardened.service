@@ -7,6 +7,10 @@ StartLimitBurst=3
 
 [Service]
 Type=simple
+# Docker is a system service a user unit cannot order itself after, so wait for
+# it here (up to 10 minutes) rather than fail fast and exhaust the restart burst.
+ExecStartPre=/bin/bash %h/.local/share/ogwp-hardened/hardened/wait-docker.sh
+TimeoutStartSec=11min
 ExecStart=/bin/bash %h/.local/share/ogwp-hardened/hardened/run.sh
 # Runs however the supervisor ended, including SIGKILL, an OOM kill or the stop
 # timeout, so no workload keeps leasing without the drift monitor.

@@ -9,6 +9,7 @@ import json
 import hashlib
 from pathlib import Path
 import re
+import stat
 import subprocess
 
 SERVICES = {"agent", "comfy", "egress"}
@@ -16,6 +17,7 @@ SERVICES = {"agent", "comfy", "egress"}
 # report healthy while nothing answers on the port the agent uses.
 COMFY_HEALTHCHECK = ["CMD", "/opt/comfy/venv/bin/python", "-c",
                      "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8188/system_stats', timeout=3).close()"]
+AGENT_ENTRYPOINT = ["python", "-m", "outbound_gpu_worker_pool.agent_main"]
 REQUIRED_MOUNTS = {"agent": {"/run/credentials/worker.json"}, "comfy": {"/opt/comfy/models"}}
 MOUNTS = {
     "agent": {"/run/credentials/worker.json"},
@@ -105,6 +107,9 @@ def violations(containers: list[dict], networks: dict[str, dict], *, allow_stopp
                     for k, v in tmpfs.items()), "scratch execution or device policy drift")
         env = dict(x.split("=", 1) for x in cfg.get("Env", []) if "=" in x)
         if name == "agent":
+            # A running container is not a running agent: pin the reviewed command.
+            require(cfg.get("Entrypoint") == AGENT_ENTRYPOINT and not cfg.get("Cmd"),
+                    "reviewed agent entrypoint required")
             comfy_id = indexed.get("comfy", {}).get("Id", "missing")
             require(host.get("NetworkMode") == "container:" + comfy_id, "agent must share only the isolated ComfyUI network")
             require(env.get("OGWP_COMFY_START_COMMAND", "") == "", "host runtime start commands forbidden")
@@ -172,10 +177,16 @@ def verify_models(root: Path, manifest: Path) -> list[str]:
             expected[name] = record
         files = {}
         for path in root.rglob("*"):
-            if path.is_symlink():
+            mode = path.lstat().st_mode
+            if stat.S_ISLNK(mode):
                 return ["model tree contains symlink"]
-            if path.is_file():
-                files[path.relative_to(root).as_posix()] = path
+            if stat.S_ISDIR(mode):
+                continue
+            if not stat.S_ISREG(mode):
+                # A FIFO, socket or device in a read-only mount can still be opened
+                # for host IPC from the runtime.
+                return ["model tree contains a special file"]
+            files[path.relative_to(root).as_posix()] = path
         if files.keys() != expected.keys():
             return ["model inventory differs from approved manifest"]
         for name, path in files.items():

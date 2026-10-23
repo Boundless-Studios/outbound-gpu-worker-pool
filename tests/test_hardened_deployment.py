@@ -89,6 +89,7 @@ def deployment():
     agent["HostConfig"]["NetworkMode"] = "container:comfy"
     agent["Mounts"] = [{"Type": "bind", "Destination": "/run/credentials/worker.json",
                         "Source": approved["OGWP_WORKER_CREDENTIAL"], "RW": False}]
+    agent["Config"]["Entrypoint"] = ["python", "-m", "outbound_gpu_worker_pool.agent_main"]
     agent["Config"]["Env"] = ["HTTPS_PROXY=http://egress:3128", "NO_PROXY=localhost,127.0.0.1,::1",
                               "OGWP_COMFY_URL=http://127.0.0.1:8188", "OGWP_WORKER_GPU_TELEMETRY=comfy"]
     comfy["HostConfig"]["Dns"] = ["127.0.0.1"]
@@ -125,7 +126,8 @@ def test_complete_profile_and_prestart_gate():
                                     "unconfined", "unbounded_memory", "docker_restart", "shared_pid",
                                     "shared_ipc", "host_ipc", "missing_models", "missing_credential",
                                     "ipv6_gateway", "missing_gpu", "trivial_healthcheck",
-                                    "egress_macvlan", "egress_attachable", "egress_swarm"])
+                                    "egress_macvlan", "egress_attachable", "egress_swarm",
+                                    "agent_entrypoint", "agent_arguments"])
 def test_configuration_drift_fails_closed(change):
     containers, networks, approved = deployment()
     if change == "host_mount":
@@ -164,6 +166,10 @@ def test_configuration_drift_fails_closed(change):
         networks["outbound"]["Attachable"] = True
     elif change == "egress_swarm":
         networks["outbound"].update(Driver="overlay", Scope="swarm")
+    elif change == "agent_entrypoint":
+        containers[0]["Config"]["Entrypoint"] = ["sleep", "infinity"]
+    elif change == "agent_arguments":
+        containers[0]["Config"]["Cmd"] = ["--something-else"]
     assert gate.violations(containers, networks, approved=approved)
 
 
@@ -191,7 +197,7 @@ def test_allowlist_drift_rejected():
     assert gate.violations(containers, networks, approved=approved)
 
 
-@pytest.mark.parametrize("change", ["none", "content", "extra", "symlink", "traversal", "missing"])
+@pytest.mark.parametrize("change", ["none", "content", "extra", "symlink", "traversal", "missing", "fifo", "socket"])
 def test_model_content_integrity(tmp_path, change):
     import hashlib
     import json
@@ -210,6 +216,21 @@ def test_model_content_integrity(tmp_path, change):
         records[0]["file"] = "../test.safetensors"
     elif change == "missing":
         model.unlink()
+    elif change == "fifo":
+        import os
+        os.mkfifo(root / "pipe")
+    elif change == "socket":
+        import os
+        import socket
+        # Bound by a relative name: macOS caps a socket path at 104 bytes.
+        here = os.getcwd()
+        os.chdir(root)
+        try:
+            listener = socket.socket(socket.AF_UNIX)
+            listener.bind("s")
+            listener.close()
+        finally:
+            os.chdir(here)
     manifest = tmp_path / "manifest.json"
     manifest.write_text(json.dumps(records))
     assert bool(gate.verify_models(root, manifest)) == (change != "none")
@@ -381,3 +402,37 @@ def test_the_runtime_probe_fails_when_nothing_answers(monkeypatch):
 
     monkeypatch.setattr(urllib.request, "urlopen", refuse)
     assert probe.runtime_answers() is False
+
+
+def test_the_unit_waits_for_docker_before_counting_a_failed_start():
+    directory = Path(__file__).parents[1] / "deploy/hardened"
+    unit = (directory / "ogwp-hardened.service").read_text()
+    pre = unit.index("ExecStartPre=/bin/bash %h/.local/share/ogwp-hardened/hardened/wait-docker.sh")
+    assert pre < unit.index("ExecStart=/bin/bash")
+    assert "TimeoutStartSec=11min" in unit  # longer than the 10-minute wait
+
+
+@pytest.mark.parametrize("failures,timeout,succeeds", [(0, 5, True), (2, 5, True), (1000, 1, False)])
+def test_wait_docker_returns_once_docker_answers_and_gives_up_after_its_deadline(tmp_path, failures, timeout, succeeds):
+    import os
+    import subprocess
+    import sys
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    (fake / "docker").write_text(f"""#!{sys.executable}
+import pathlib, sys
+calls = pathlib.Path({str(tmp_path / 'calls')!r})
+count = int(calls.read_text()) if calls.exists() else 0
+calls.write_text(str(count + 1))
+sys.exit(1 if count < {failures} else 0)
+""")
+    (fake / "docker").chmod(0o755)
+    env = {**os.environ, "PATH": f"{fake}{os.pathsep}{os.environ['PATH']}",
+           "OGWP_DOCKER_WAIT_SECONDS": str(timeout), "OGWP_DOCKER_WAIT_INTERVAL": "0.1"}
+    script = Path(__file__).parents[1] / "deploy/hardened/wait-docker.sh"
+    result = subprocess.run(["bash", str(script)], env=env, capture_output=True, text=True, timeout=30)
+    assert (result.returncode == 0) is succeeds
+    if succeeds:
+        assert int((tmp_path / "calls").read_text()) == failures + 1
+    else:
+        assert "did not become ready" in result.stderr

@@ -16,7 +16,7 @@ import json
 from urllib.parse import urlsplit
 from collections.abc import Callable, Sequence
 
-from outbound_gpu_worker_pool.contracts import GpuTelemetry
+from outbound_gpu_worker_pool.contracts import MAX_GPU_NAME_LENGTH, GpuTelemetry
 
 logger = logging.getLogger(__name__)
 
@@ -147,7 +147,9 @@ def _parse_comfy_stats(document: dict) -> tuple[GpuTelemetry, ...]:
                 or not 0 <= free <= total <= 2**50 or not 0 <= index < 16):
             raise ValueError("invalid GPU memory or index")
         name = device["name"]
-        if not isinstance(name, str) or not 1 <= len(name) <= 256:
+        # The heartbeat rejects longer names, which would fail every heartbeat
+        # instead of dropping this sample.
+        if not isinstance(name, str) or not 1 <= len(name) <= MAX_GPU_NAME_LENGTH:
             raise ValueError("invalid GPU name")
         result.append(GpuTelemetry(index=index, name=name, utilization_pct=None,
                                    memory_used_mb=(total - free) // 2**20,
