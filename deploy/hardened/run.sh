@@ -10,12 +10,9 @@ else
   echo "This profile currently verifies WSL GPU isolation; supply a reviewed native GPU profile before using another host." >&2
   exit 2
 fi
-cleanup() {
-  # Agent SIGTERM stops leasing, completes/releases its current lease and drains.
-  "${compose[@]}" stop --timeout 1500 agent || true
-  "${compose[@]}" stop --timeout 30 comfy egress || true
-}
-trap cleanup EXIT
+# stop.sh is also systemd's ExecStopPost, so the workloads stop even when this
+# supervisor is killed outright and cannot run its trap.
+trap '/bin/bash "$HERE/stop.sh"' EXIT
 trap 'exit 0' TERM INT
 
 # Verify model bytes before ComfyUI can load them. The host administrator remains trusted.

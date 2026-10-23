@@ -12,6 +12,10 @@ import re
 import subprocess
 
 SERVICES = {"agent", "comfy", "egress"}
+# The ComfyUI healthcheck must be this exact runtime check: any other command can
+# report healthy while nothing answers on the port the agent uses.
+COMFY_HEALTHCHECK = ["CMD", "/opt/comfy/venv/bin/python", "-c",
+                     "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8188/system_stats', timeout=3).close()"]
 REQUIRED_MOUNTS = {"agent": {"/run/credentials/worker.json"}, "comfy": {"/opt/comfy/models"}}
 MOUNTS = {
     "agent": {"/run/credentials/worker.json"},
@@ -71,6 +75,12 @@ def violations(containers: list[dict], networks: dict[str, dict], *, allow_stopp
             require(name == "comfy" and device.get("PathOnHost") == "/dev/dxg"
                     and device.get("PathInContainer") == "/dev/dxg"
                     and device.get("CgroupPermissions") == "rw", "unreviewed device mount")
+        if name == "comfy":
+            # This profile is WSL-only: without the GPU device the runtime would start,
+            # advertise its GPU and fail (or run without the GPU) every job it leases.
+            require(any(d.get("PathOnHost") == "/dev/dxg" and d.get("PathInContainer") == "/dev/dxg"
+                        and d.get("CgroupPermissions") == "rw" for d in host.get("Devices") or []),
+                    "WSL GPU device required")
         present = {m.get("Destination") for m in c.get("Mounts", []) if m.get("Type") != "tmpfs"}
         # Verified model bytes mean nothing unless the runtime actually loads them.
         require(REQUIRED_MOUNTS.get(name, set()) <= present, "required host mount missing")
@@ -114,6 +124,8 @@ def violations(containers: list[dict], networks: dict[str, dict], *, allow_stopp
                         "network must deny external routes and host gateway access")
             require(host.get("Dns") == ["127.0.0.1"], "external DNS forwarding forbidden")
             require(c.get("State", {}).get("Health", {}).get("Status") == "healthy", "runtime is not healthy")
+            require((cfg.get("Healthcheck") or {}).get("Test") == COMFY_HEALTHCHECK,
+                    "the runtime healthcheck must be the reviewed /system_stats check")
             require("--disable-all-custom-nodes" in cfg.get("Cmd", [])
                     and "--disable-api-nodes" in cfg.get("Cmd", []), "unreviewed custom/API nodes must be disabled")
         elif name == "egress":
@@ -129,6 +141,14 @@ def violations(containers: list[dict], networks: dict[str, dict], *, allow_stopp
     egress_networks = set(indexed.get("egress", {}).get("NetworkSettings", {}).get("Networks", {}))
     if not comfy_networks or not comfy_networks < egress_networks:
         errors.append("proxy must bridge the isolated workload network and only one outbound network")
+    for network_name in egress_networks - comfy_networks:
+        network = networks.get(network_name, {})
+        # The relay listens on all its interfaces, so its outbound network must be a
+        # host-local bridge nothing else can join or route into.
+        if (network.get("Driver") != "bridge" or network.get("Scope") != "local" or network.get("Attachable")
+                or network.get("Ingress") or network.get("ConfigFrom", {}).get("Network")
+                or network.get("Internal")):
+            errors.append("egress outbound network must be a private local bridge")
     for network_name in comfy_networks:
         network = networks.get(network_name, {})
         expected = {indexed.get("comfy", {}).get("Id"), indexed.get("egress", {}).get("Id")}

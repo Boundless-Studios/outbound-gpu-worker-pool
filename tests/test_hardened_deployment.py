@@ -62,6 +62,10 @@ def test_host_socket_and_privileges_fail_gate():
     assert "agent: all capabilities must be dropped" in errors
 
 
+HEALTHCHECK = ["CMD", "/opt/comfy/venv/bin/python", "-c",
+               "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8188/system_stats', timeout=3).close()"]
+
+
 def deployment():
     approved = {"OGWP_AGENT_IMAGE": "sha256:" + "a" * 64,
                 "OGWP_COMFY_IMAGE": "sha256:" + "b" * 64,
@@ -88,6 +92,9 @@ def deployment():
     agent["Config"]["Env"] = ["HTTPS_PROXY=http://egress:3128", "NO_PROXY=localhost,127.0.0.1,::1",
                               "OGWP_COMFY_URL=http://127.0.0.1:8188", "OGWP_WORKER_GPU_TELEMETRY=comfy"]
     comfy["HostConfig"]["Dns"] = ["127.0.0.1"]
+    comfy["HostConfig"]["Devices"] = [{"PathOnHost": "/dev/dxg", "PathInContainer": "/dev/dxg",
+                                       "CgroupPermissions": "rw"}]
+    comfy["Config"]["Healthcheck"] = {"Test": list(HEALTHCHECK)}
     comfy["Config"]["Cmd"] = ["--disable-all-custom-nodes", "--disable-api-nodes"]
     comfy["NetworkSettings"]["Networks"] = {"isolated": {}}
     comfy["Mounts"] = [{"Type": "bind", "Destination": "/opt/comfy/models",
@@ -98,7 +105,8 @@ def deployment():
     networks = {"isolated": {"Internal": True, "Driver": "bridge",
                 "Options": {"com.docker.network.bridge.gateway_mode_ipv4": "isolated",
                             "com.docker.network.bridge.gateway_mode_ipv6": "isolated"},
-                "Containers": {"comfy": {}, "egress": {}}}, "outbound": {}}
+                "Containers": {"comfy": {}, "egress": {}}},
+                "outbound": {"Driver": "bridge", "Scope": "local", "Internal": False, "Attachable": False}}
     return containers, networks, approved
 
 
@@ -116,7 +124,8 @@ def test_complete_profile_and_prestart_gate():
 @pytest.mark.parametrize("change", ["host_mount", "host_gateway", "mutable_image", "extra_peer",
                                     "unconfined", "unbounded_memory", "docker_restart", "shared_pid",
                                     "shared_ipc", "host_ipc", "missing_models", "missing_credential",
-                                    "ipv6_gateway"])
+                                    "ipv6_gateway", "missing_gpu", "trivial_healthcheck",
+                                    "egress_macvlan", "egress_attachable", "egress_swarm"])
 def test_configuration_drift_fails_closed(change):
     containers, networks, approved = deployment()
     if change == "host_mount":
@@ -145,6 +154,16 @@ def test_configuration_drift_fails_closed(change):
         containers[0]["Mounts"] = []
     elif change == "ipv6_gateway":
         networks["isolated"]["Options"]["com.docker.network.bridge.gateway_mode_ipv6"] = "nat"
+    elif change == "missing_gpu":
+        containers[1]["HostConfig"]["Devices"] = []
+    elif change == "trivial_healthcheck":
+        containers[1]["Config"]["Healthcheck"] = {"Test": ["CMD", "true"]}
+    elif change == "egress_macvlan":
+        networks["outbound"]["Driver"] = "macvlan"
+    elif change == "egress_attachable":
+        networks["outbound"]["Attachable"] = True
+    elif change == "egress_swarm":
+        networks["outbound"].update(Driver="overlay", Scope="swarm")
     assert gate.violations(containers, networks, approved=approved)
 
 
@@ -335,3 +354,30 @@ async def test_the_relay_only_tunnels_tls_to_the_connect_host(monkeypatch, serve
         await server.wait_closed()
         upstream.close()
         await upstream.wait_closed()
+
+
+def test_the_compose_healthcheck_is_the_one_the_gate_requires():
+    compose = (Path(__file__).parents[1] / "deploy/hardened/compose.yaml").read_text()
+    assert gate.COMFY_HEALTHCHECK == HEALTHCHECK
+    command, executable, flag, code = HEALTHCHECK
+    assert f'test: [{command}, {executable}, {flag}, "{code}"]' in compose
+
+
+def test_systemd_tears_the_workloads_down_however_the_supervisor_ends():
+    directory = Path(__file__).parents[1] / "deploy/hardened"
+    unit = (directory / "ogwp-hardened.service").read_text()
+    assert "ExecStopPost=/bin/bash %h/.local/share/ogwp-hardened/hardened/stop.sh" in unit
+    assert 'trap \'/bin/bash "$HERE/stop.sh"\' EXIT' in (directory / "run.sh").read_text()
+    stop = [line for line in (directory / "stop.sh").read_text().splitlines() if "stop --timeout" in line]
+    assert len(stop) == 2 and stop[0].endswith("agent || true") and "comfy egress" in stop[1]
+
+
+def test_the_runtime_probe_fails_when_nothing_answers(monkeypatch):
+    import urllib.request
+    probe = module("probe")
+
+    def refuse(*args, **kwargs):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(urllib.request, "urlopen", refuse)
+    assert probe.runtime_answers() is False

@@ -17,6 +17,16 @@ def blocked_connection(host, port):
         return True
 
 
+def runtime_answers():
+    """The agent's own view of the runtime, independent of the container healthcheck."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:8188/system_stats", timeout=5) as response:
+            return response.status == 200 and b"devices" in response.read(65536)
+    except OSError:
+        return False
+
+
 def denied_write(directory):
     path = Path(directory) / ".ogwp-isolation-probe"
     try:
@@ -58,6 +68,7 @@ def main():
     scratch.unlink()
     checks["scratch_writable"] = True
     if role == "comfy":
+        checks["runtime_answers"] = runtime_answers()
         checks["models_write_denied"] = denied_write("/opt/comfy/models")
         checks["no_worker_credential"] = not Path("/run/credentials/worker.json").exists()
     else:
