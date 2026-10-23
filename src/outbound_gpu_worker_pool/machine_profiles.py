@@ -67,12 +67,14 @@ def describe_profile(profile: str) -> dict[str, Any]:
     return {**description, 'recipe_version': fingerprint}
 
 
-def profile_features(profile: str) -> dict[str, str]:
-    """Optional features the profile's verified graph supports, as runtime versions.
+def profile_features(profile: str, object_info: dict[str, Any]) -> dict[str, str]:
+    """Optional features this worker can actually run, as runtime versions.
 
-    Only the standard route declares last-frame conditioning, and only while its
-    template actually wires a `last_frame` image slot into the H3 node's
-    `last_frame` input. The bounded 16GB route declares nothing here.
+    Only the standard route declares last-frame conditioning, and only while both
+    its template wires a `last_frame` image slot into the H3 node's `last_frame`
+    input and the live ComfyUI node (`object_info`) accepts that input. An older
+    node that lacks it would lease a closed-loop job and fail inside ComfyUI.
+    The bounded 16GB route declares nothing here.
     """
     if profile != STANDARD:
         return {}
@@ -82,7 +84,9 @@ def profile_features(profile: str) -> dict[str, str]:
         node['class_type'] == 'MiniMaxH3ImageToVideo'
         and node['inputs'].get('last_frame') == [slot.node_id, 0]
         for node in template.graph.values())
-    return {LAST_FRAME_FEATURE_KEY: '1'} if wired else {}
+    live = object_info.get('MiniMaxH3ImageToVideo', {}).get('input', {})
+    accepts = 'last_frame' in {**live.get('required', {}), **live.get('optional', {})}
+    return {LAST_FRAME_FEATURE_KEY: '1'} if wired and accepts else {}
 
 
 async def inspect_runtime(profile: str, client: Any, base_url: str) -> dict[str, str]:
@@ -134,7 +138,7 @@ async def inspect_runtime(profile: str, client: Any, base_url: str) -> dict[str,
     versions[CONFIG_KEY] = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
     # After the configuration fingerprint, so declaring a feature changes neither it
     # nor the recipe version.
-    versions.update(profile_features(profile))
+    versions.update(profile_features(profile, info))
     return versions
 
 

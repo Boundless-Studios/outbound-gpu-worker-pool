@@ -82,8 +82,22 @@ def test_declaring_features_keeps_every_recipe_version():
 
 
 def test_only_the_standard_route_declares_last_frame():
-    assert profile_features(STANDARD) == {LAST_FRAME_FEATURE_KEY: '1'}
-    assert profile_features(LIGHTX8) == {}
+    _, info = standard_runtime()
+    assert profile_features(STANDARD, info) == {LAST_FRAME_FEATURE_KEY: '1'}
+    assert profile_features(LIGHTX8, info) == {}
+
+
+@pytest.mark.parametrize('schema', ['absent', 'node-missing'])
+async def test_last_frame_is_not_advertised_when_the_live_node_lacks_it(schema):
+    stats, info = standard_runtime()
+    if schema == 'absent':
+        info['MiniMaxH3ImageToVideo']['input']['optional'].pop('last_frame')
+    else:
+        info['MiniMaxH3ImageToVideo']['input'].pop('optional')
+    assert profile_features(STANDARD, info) == {}
+    versions = await inspect_profile(STANDARD, stats, info)
+    assert LAST_FRAME_FEATURE_KEY not in versions
+    assert versions[RECIPE_KEY] == STANDARD_RECIPE_BEFORE_FEATURES
 
 
 def test_last_frame_is_declared_only_while_the_template_wires_it(monkeypatch):
@@ -92,8 +106,9 @@ def test_last_frame_is_declared_only_while_the_template_wires_it(monkeypatch):
     h3 = next(node for node in graph.values() if node['class_type'] == 'MiniMaxH3ImageToVideo')
     del h3['inputs']['last_frame']
     unwired = TemplateRegistry([replace(template, graph=graph)])
+    _, info = standard_runtime()
     monkeypatch.setattr(machine_profiles, 'registry_for', lambda profile: unwired)
-    assert profile_features(STANDARD) == {}
+    assert profile_features(STANDARD, info) == {}
 
 
 def standard_runtime():
@@ -105,6 +120,8 @@ def standard_runtime():
         for key, value in node['inputs'].items():
             if key in {'unet_name', 'clip_name', 'vae_name', 'lora_name'}:
                 fields.setdefault(key, [[]])[0].append(value)
+    # The live H3 node accepts the optional last frame, as current ComfyUI builds do.
+    info['MiniMaxH3ImageToVideo']['input']['optional'] = {'last_frame': ['IMAGE']}
     return stats, info
 
 
@@ -120,7 +137,7 @@ async def test_standard_runtime_advertises_last_frame_without_changing_its_finge
     versions = await inspect_profile(STANDARD, stats, info)
     assert versions[LAST_FRAME_FEATURE_KEY] == '1'
     assert versions[RECIPE_KEY] == STANDARD_RECIPE_BEFORE_FEATURES
-    monkeypatch.setattr(machine_profiles, 'profile_features', lambda profile: {})
+    monkeypatch.setattr(machine_profiles, 'profile_features', lambda profile, info: {})
     before = await inspect_profile(STANDARD, stats, info)
     assert LAST_FRAME_FEATURE_KEY not in before
     assert versions == {**before, LAST_FRAME_FEATURE_KEY: '1'}
