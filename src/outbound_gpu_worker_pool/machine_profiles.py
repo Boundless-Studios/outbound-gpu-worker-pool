@@ -2,6 +2,9 @@
 
 The bounded 16GB graph is opt-in, outside the standard template directory.
 A profile's fingerprint binds discovery, lease eligibility and execution.
+Optional features are separate runtime versions, outside that fingerprint, so
+declaring one never makes an already-registered worker ineligible for the
+jobs it already serves; only a job that requires the feature asks for it.
 """
 from __future__ import annotations
 
@@ -19,6 +22,8 @@ CONFIG_KEY = 'magic_config'
 PROFILE_DIRECTORY = PACKAGED_TEMPLATES_DIRECTORY / 'machine_profiles'
 LIGHTX8_CAPABILITY = 'video.minimax_h3.text_to_video.w4a8_16gb.lightx8.v1'
 STANDARD_CAPABILITY = 'video.minimax_h3.text_to_video.v1'
+# Closed-loop (first frame == last frame) conditioning, required only by such jobs.
+LAST_FRAME_FEATURE_KEY = 'magic_feature_last_frame'
 
 
 def registry_for(profile: str) -> TemplateRegistry:
@@ -60,6 +65,24 @@ def describe_profile(profile: str) -> dict[str, Any]:
     fingerprint = hashlib.sha256(json.dumps({'description': description, 'graph': graph},
                                            sort_keys=True, separators=(',', ':')).encode()).hexdigest()
     return {**description, 'recipe_version': fingerprint}
+
+
+def profile_features(profile: str) -> dict[str, str]:
+    """Optional features the profile's verified graph supports, as runtime versions.
+
+    Only the standard route declares last-frame conditioning, and only while its
+    template actually wires a `last_frame` image slot into the H3 node's
+    `last_frame` input. The bounded 16GB route declares nothing here.
+    """
+    if profile != STANDARD:
+        return {}
+    template = registry_for(profile).template(STANDARD_CAPABILITY)
+    slot = next((s for s in template.image_slots if s.name == 'last_frame'), None)
+    wired = slot is not None and any(
+        node['class_type'] == 'MiniMaxH3ImageToVideo'
+        and node['inputs'].get('last_frame') == [slot.node_id, 0]
+        for node in template.graph.values())
+    return {LAST_FRAME_FEATURE_KEY: '1'} if wired else {}
 
 
 async def inspect_runtime(profile: str, client: Any, base_url: str) -> dict[str, str]:
@@ -109,6 +132,9 @@ async def inspect_runtime(profile: str, client: Any, base_url: str) -> dict[str,
                 'reserve_vram': str(argv[argv.index('--reserve-vram')+1]) if '--reserve-vram' in argv else 'comfy-default'}
     config = {'versions': versions, 'argv': argv, 'models': description['models']}
     versions[CONFIG_KEY] = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
+    # After the configuration fingerprint, so declaring a feature changes neither it
+    # nor the recipe version.
+    versions.update(profile_features(profile))
     return versions
 
 

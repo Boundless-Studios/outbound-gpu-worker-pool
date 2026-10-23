@@ -1,10 +1,15 @@
 import copy
 import json
 
+from dataclasses import replace
+
 import httpx
 import pytest
+from outbound_gpu_worker_pool import machine_profiles
+from outbound_gpu_worker_pool.comfy import TemplateRegistry
 from outbound_gpu_worker_pool.machine_profiles import (
-    LIGHTX8, STANDARD, RECIPE_KEY, CONFIG_KEY, describe_profile, inspect_runtime, registry_for,
+    LIGHTX8, STANDARD, RECIPE_KEY, CONFIG_KEY, LAST_FRAME_FEATURE_KEY, STANDARD_CAPABILITY,
+    describe_profile, inspect_runtime, profile_features, registry_for,
 )
 
 
@@ -62,3 +67,67 @@ def test_bounded_profile_does_not_change_the_standard_route():
     assert entries['steps'].minimum==entries['steps'].maximum==8
     assert entries['width'].maximum==entries['height'].maximum==512
     assert entries['length'].maximum==96
+
+
+# Recipe fingerprints on main before the last-frame feature was declared. A
+# changed value here would make every registered worker of that profile
+# ineligible for jobs it already serves.
+STANDARD_RECIPE_BEFORE_FEATURES = '54c9d39861b76e30226db5cc03e98b5c579bcef1809f746775e9e29ec3fb7f4f'
+LIGHTX8_RECIPE_BEFORE_FEATURES = '2c2e440f34ea8037ea52d36ebd1743540481a277f695ddb46f1ed6cc138e446d'
+
+
+def test_declaring_features_keeps_every_recipe_version():
+    assert describe_profile(STANDARD)['recipe_version'] == STANDARD_RECIPE_BEFORE_FEATURES
+    assert describe_profile(LIGHTX8)['recipe_version'] == LIGHTX8_RECIPE_BEFORE_FEATURES
+
+
+def test_only_the_standard_route_declares_last_frame():
+    assert profile_features(STANDARD) == {LAST_FRAME_FEATURE_KEY: '1'}
+    assert profile_features(LIGHTX8) == {}
+
+
+def test_last_frame_is_declared_only_while_the_template_wires_it(monkeypatch):
+    template = registry_for(STANDARD).template(STANDARD_CAPABILITY)
+    graph = copy.deepcopy(template.graph)
+    h3 = next(node for node in graph.values() if node['class_type'] == 'MiniMaxH3ImageToVideo')
+    del h3['inputs']['last_frame']
+    unwired = TemplateRegistry([replace(template, graph=graph)])
+    monkeypatch.setattr(machine_profiles, 'registry_for', lambda profile: unwired)
+    assert profile_features(STANDARD) == {}
+
+
+def standard_runtime():
+    stats = {'system': {'comfyui_version': '0.41.0', 'pytorch_version': '2.14.0+cu130', 'argv': []},
+             'devices': [{'type': 'cuda', 'name': 'RTX 4090', 'vram_total': 24564 * 1024**2}]}
+    info = {}
+    for node in registry_for(STANDARD).template(STANDARD_CAPABILITY).graph.values():
+        fields = info.setdefault(node['class_type'], {'input': {'required': {}}})['input']['required']
+        for key, value in node['inputs'].items():
+            if key in {'unet_name', 'clip_name', 'vae_name', 'lora_name'}:
+                fields.setdefault(key, [[]])[0].append(value)
+    return stats, info
+
+
+async def inspect_profile(profile, stats, info):
+    def handle(request):
+        return httpx.Response(200, json=stats if request.url.path == '/system_stats' else info)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        return await inspect_runtime(profile, client, 'http://localhost:8188')
+
+
+async def test_standard_runtime_advertises_last_frame_without_changing_its_fingerprints(monkeypatch):
+    stats, info = standard_runtime()
+    versions = await inspect_profile(STANDARD, stats, info)
+    assert versions[LAST_FRAME_FEATURE_KEY] == '1'
+    assert versions[RECIPE_KEY] == STANDARD_RECIPE_BEFORE_FEATURES
+    monkeypatch.setattr(machine_profiles, 'profile_features', lambda profile: {})
+    before = await inspect_profile(STANDARD, stats, info)
+    assert LAST_FRAME_FEATURE_KEY not in before
+    assert versions == {**before, LAST_FRAME_FEATURE_KEY: '1'}
+
+
+async def test_bounded_runtime_versions_are_unchanged():
+    stats, info = runtime()
+    versions = await inspect(stats, info)
+    assert LAST_FRAME_FEATURE_KEY not in versions
+    assert versions[RECIPE_KEY] == LIGHTX8_RECIPE_BEFORE_FEATURES

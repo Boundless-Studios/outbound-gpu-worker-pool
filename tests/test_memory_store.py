@@ -783,3 +783,30 @@ async def test_recipe_and_worker_binding_survive_leasing_and_retry():
     assert await lease('other', 'B-v1') is None
     assert await lease('chosen', 'B-v2') is None
     assert (await lease('chosen', 'B-v1')).attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_last_frame_feature_gates_only_jobs_that_require_it():
+    from outbound_gpu_worker_pool.machine_profiles import (
+        LAST_FRAME_FEATURE_KEY, RECIPE_KEY, STANDARD, describe_profile,
+    )
+    recipe = describe_profile(STANDARD)['recipe_version']
+    store = MemoryJobStore()
+    def submit(key, runtime_versions):
+        return store.submit(JobSubmission(
+            job_id=str(uuid4()), idempotency_key=key, capability_id=DETERMINISTIC_ECHO_CAPABILITY,
+            input_keys=(), output_key=f'outputs/{key}',
+            requirements=JobRequirements(runtime_versions=runtime_versions)))
+    async def lease(worker, versions):
+        return await store.lease(worker_id=worker, capability_ids=(DETERMINISTIC_ECHO_CAPABILITY,),
+                                 lease_seconds=60, runtime_versions=versions)
+    # A worker registered before the feature existed reports the same recipe, no feature.
+    registered_before = {RECIPE_KEY: recipe, 'magic_config': 'c' * 64}
+    updated = {**registered_before, LAST_FRAME_FEATURE_KEY: '1'}
+
+    await submit('closed-loop', {RECIPE_KEY: recipe, LAST_FRAME_FEATURE_KEY: '1'})
+    assert await lease('registered-before', registered_before) is None
+    assert (await lease('updated', updated)).idempotency_key == 'closed-loop'
+
+    await submit('ordinary', {RECIPE_KEY: recipe})
+    assert (await lease('registered-before', registered_before)).idempotency_key == 'ordinary'
