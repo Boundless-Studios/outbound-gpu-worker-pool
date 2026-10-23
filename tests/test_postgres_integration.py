@@ -1004,3 +1004,22 @@ async def test_completed_worker_identity_is_preserved(pool_fixture: PoolFixture)
     completed = await pool_fixture.jobs.get(job_id)
     assert completed.executed_by == 'selected'
     assert completed.leased_by is None
+
+
+async def test_last_frame_feature_gates_only_jobs_that_require_it_in_postgres(pool_fixture: PoolFixture) -> None:
+    from outbound_gpu_worker_pool.machine_profiles import (
+        LAST_FRAME_FEATURE_KEY, RECIPE_KEY, STANDARD, describe_profile,
+    )
+    recipe = describe_profile(STANDARD)['recipe_version']
+    registered_before = {RECIPE_KEY: recipe, 'magic_config': 'c' * 64}
+    updated = {**registered_before, LAST_FRAME_FEATURE_KEY: '1'}
+    async def lease(worker_id, versions):
+        return await pool_fixture.jobs.lease(worker_id=worker_id, capability_ids=(ECHO,),
+                                             lease_seconds=60, runtime_versions=versions)
+    closed_loop = await _submit(pool_fixture, 'closed-loop', requirements=JobRequirements(
+        runtime_versions={RECIPE_KEY: recipe, LAST_FRAME_FEATURE_KEY: '1'}))
+    assert await lease('registered-before', registered_before) is None
+    assert (await lease('updated', updated)).job_id == closed_loop
+    ordinary = await _submit(pool_fixture, 'ordinary', requirements=JobRequirements(
+        runtime_versions={RECIPE_KEY: recipe}))
+    assert (await lease('registered-before', registered_before)).job_id == ordinary
