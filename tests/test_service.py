@@ -483,3 +483,47 @@ async def test_bound_recipe_rejects_missing_or_different_execution_attestation(d
         await harness.service.complete(WORKER_A, grant.job_id, grant.claim_token,
                                        _manifest(grant, OUTPUT_BYTES, diagnostics=diagnostics))
     assert harness.jobs.records[grant.job_id].status == JobStatus.FAILED
+
+
+@pytest.mark.parametrize('profile', ['h3-24gb-standard', 'h3-16gb-lightx8'])
+@pytest.mark.parametrize('change,accepted', [(None, True), ('steps', False), ('seed', False)])
+async def test_bound_recipe_compares_omitted_inputs_with_the_recipe_defaults(profile, change, accepted):
+    """A prompt-only job is valid: the profile worker attests the template defaults it ran."""
+    from outbound_gpu_worker_pool import JobRequirements
+    from outbound_gpu_worker_pool.machine_profiles import describe_profile, recipe_input_defaults
+    recipe = describe_profile(profile)['recipe_version']
+    harness = _harness()
+    grant = await _leased(harness)
+    record = harness.jobs.records[grant.job_id]
+    harness.jobs.records[grant.job_id] = replace(
+        record, payload={'prompt': 'a knight turns'},
+        requirements=JobRequirements(runtime_versions={'magic_recipe': recipe}))
+    effective = {**recipe_input_defaults(recipe), 'prompt': 'a knight turns'}
+    if change:
+        effective[change] += 1
+    await harness.assets.write_once(grant.output_key, OUTPUT_BYTES, 'text/plain')
+    complete = harness.service.complete(WORKER_A, grant.job_id, grant.claim_token, _manifest(
+        grant, OUTPUT_BYTES, diagnostics={'runtime_versions': {'magic_recipe': recipe}, 'effective_inputs': effective}))
+    if accepted:
+        await complete
+        assert harness.jobs.records[grant.job_id].status == JobStatus.COMPLETED
+    else:
+        with pytest.raises(CompletionRejected, match='effective_inputs_mismatch'):
+            await complete
+
+
+async def test_a_supplied_input_still_beats_the_recipe_default():
+    from outbound_gpu_worker_pool import JobRequirements
+    from outbound_gpu_worker_pool.machine_profiles import STANDARD, describe_profile, recipe_input_defaults
+    recipe = describe_profile(STANDARD)['recipe_version']
+    harness = _harness()
+    grant = await _leased(harness)
+    record = harness.jobs.records[grant.job_id]
+    harness.jobs.records[grant.job_id] = replace(
+        record, payload={'prompt': 'p', 'steps': 12},
+        requirements=JobRequirements(runtime_versions={'magic_recipe': recipe}))
+    await harness.assets.write_once(grant.output_key, OUTPUT_BYTES, 'text/plain')
+    with pytest.raises(CompletionRejected, match='effective_inputs_mismatch'):
+        await harness.service.complete(WORKER_A, grant.job_id, grant.claim_token, _manifest(
+            grant, OUTPUT_BYTES, diagnostics={'runtime_versions': {'magic_recipe': recipe},
+                                              'effective_inputs': recipe_input_defaults(recipe)}))

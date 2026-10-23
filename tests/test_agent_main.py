@@ -282,3 +282,13 @@ async def test_main_runs_the_mixed_agent(verified_standard, monkeypatch: pytest.
     assert await agent_main.main(STATIC_ENVIRONMENT | {"MVS_WORKER_PROFILE": "h3-24gb-standard"}) == 0
     assert built[0][0] == _standard_settings()["OGWP_WORKER_RUNTIME_VERSIONS"]
     assert built[0][1] is not None
+
+
+async def test_mixed_mode_gives_the_profile_plugin_the_start_command(verified_standard) -> None:
+    prepared, plugin = await agent_main.prepare_mixed_profile(STATIC_ENVIRONMENT | {
+        "MVS_WORKER_PROFILE": "h3-24gb-standard",
+        "OGWP_COMFY_START_COMMAND": "systemctl --user start comfyui",
+        "OGWP_COMFY_STARTUP_TIMEOUT_SECONDS": "240",
+    })
+    assert plugin._start_command == ("systemctl", "--user", "start", "comfyui")
+    assert plugin._startup_timeout_seconds == 240

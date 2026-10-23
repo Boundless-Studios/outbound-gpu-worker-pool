@@ -50,6 +50,24 @@ COMFY_WORKFLOW_PLUGIN_ID = "comfy-workflow"
 PROFILE_VARIABLE = "MVS_WORKER_PROFILE"
 
 
+def _comfy_runtime(environment: Mapping[str, str]) -> dict[str, object]:
+    """How to bring a stopped ComfyUI back, shared by the generic and profile plugins."""
+    from outbound_gpu_worker_pool.comfy import DEFAULT_COMFY_STARTUP_TIMEOUT_SECONDS
+
+    start_command_raw = environment.get("OGWP_COMFY_START_COMMAND", "")
+    return {
+        "start_command": (
+            tuple(shlex.split(start_command_raw)) if start_command_raw.strip() else None
+        ),
+        "startup_timeout_seconds": float(
+            environment.get(
+                "OGWP_COMFY_STARTUP_TIMEOUT_SECONDS",
+                DEFAULT_COMFY_STARTUP_TIMEOUT_SECONDS,
+            )
+        ),
+    }
+
+
 def _comfy_workflow_plugin(
     environment: Mapping[str, str], exclude: frozenset[str] = frozenset()
 ) -> GpuExecutorPlugin:
@@ -60,23 +78,12 @@ def _comfy_workflow_plugin(
     """
     from outbound_gpu_worker_pool.comfy import (
         DEFAULT_COMFY_BASE_URL,
-        DEFAULT_COMFY_STARTUP_TIMEOUT_SECONDS,
         PACKAGED_TEMPLATES_DIRECTORY,
         ComfyWorkflowPlugin,
         TemplateRegistry,
     )
 
     directory = environment.get("OGWP_COMFY_TEMPLATES_DIR")
-    start_command_raw = environment.get("OGWP_COMFY_START_COMMAND", "")
-    start_command = (
-        tuple(shlex.split(start_command_raw)) if start_command_raw.strip() else None
-    )
-    startup_timeout_seconds = float(
-        environment.get(
-            "OGWP_COMFY_STARTUP_TIMEOUT_SECONDS",
-            DEFAULT_COMFY_STARTUP_TIMEOUT_SECONDS,
-        )
-    )
     registry = TemplateRegistry.from_directory(
         Path(directory) if directory else PACKAGED_TEMPLATES_DIRECTORY
     )
@@ -89,8 +96,7 @@ def _comfy_workflow_plugin(
         registry,
         client=httpx.AsyncClient(timeout=COMFY_TIMEOUT_SECONDS),
         base_url=environment.get("OGWP_COMFY_URL", DEFAULT_COMFY_BASE_URL),
-        start_command=start_command,
-        startup_timeout_seconds=startup_timeout_seconds,
+        **_comfy_runtime(environment),
     )
 
 
@@ -195,6 +201,7 @@ async def prepare_mixed_profile(
         versions,
         client=httpx.AsyncClient(timeout=COMFY_TIMEOUT_SECONDS),
         base_url=prepared["OGWP_COMFY_URL"],
+        **_comfy_runtime(prepared),
     )
     return prepared, plugin
 

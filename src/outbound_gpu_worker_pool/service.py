@@ -137,6 +137,19 @@ def _without_claim_token(record: JobRecord) -> JobRecord:
     return replace(record, claim_token=None)
 
 
+def _recipe_defaults(recipe_version: str) -> dict[str, JobPayloadValue]:
+    """Template defaults for an omitted input of a recipe-bound job.
+
+    Imported lazily: only machine-profile deployments bind recipes, and those
+    install the agent extras. Without them an omitted field compares strictly.
+    """
+    try:
+        from outbound_gpu_worker_pool.machine_profiles import recipe_input_defaults
+    except ImportError:
+        return {}
+    return recipe_input_defaults(recipe_version)
+
+
 class WorkerPoolService:
     def __init__(
         self,
@@ -652,7 +665,10 @@ class WorkerPoolService:
             if not isinstance(reported, dict) or any(reported.get(k) != v for k, v in record.requirements.runtime_versions.items()):
                 raise CompletionRejected('recipe_configuration_mismatch')
             effective = manifest.diagnostics.get('effective_inputs')
-            if not isinstance(effective, dict) or any(effective.get(k) != record.payload.get(k) for k in ('steps', 'width', 'height', 'length', 'fps', 'seed')):
+            defaults = _recipe_defaults(record.requirements.runtime_versions['magic_recipe'])
+            expected = {k: record.payload[k] if k in record.payload else defaults.get(k)
+                        for k in ('steps', 'width', 'height', 'length', 'fps', 'seed')}
+            if not isinstance(effective, dict) or any(effective.get(k) != v for k, v in expected.items()):
                 raise CompletionRejected('effective_inputs_mismatch')
         if manifest.output_key != record.output_key:
             raise CompletionRejected("output_key_mismatch")
