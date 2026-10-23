@@ -148,3 +148,25 @@ async def test_bounded_runtime_versions_are_unchanged():
     versions = await inspect(stats, info)
     assert LAST_FRAME_FEATURE_KEY not in versions
     assert versions[RECIPE_KEY] == LIGHTX8_RECIPE_BEFORE_FEATURES
+
+
+async def test_a_profile_job_starts_a_stopped_runtime_before_inspecting_it(monkeypatch):
+    from outbound_gpu_worker_pool.machine_profiles import ProfileComfyPlugin
+    calls = []
+    plugin = ProfileComfyPlugin(STANDARD, {}, client=None, base_url='http://127.0.0.1:8188',
+                                start_command=('systemctl', '--user', 'start', 'comfyui'),
+                                startup_timeout_seconds=5)
+    assert plugin._start_command == ('systemctl', '--user', 'start', 'comfyui')
+
+    async def ensure_running():
+        calls.append('ensure_running')
+
+    async def inspect(*args):
+        calls.append('inspect_runtime')
+        raise ValueError('stop here')
+
+    monkeypatch.setattr(plugin, 'ensure_running', ensure_running)
+    monkeypatch.setattr(machine_profiles, 'inspect_runtime', inspect)
+    with pytest.raises(ValueError, match='stop here'):
+        await plugin.execute(None, None)
+    assert calls == ['ensure_running', 'inspect_runtime']

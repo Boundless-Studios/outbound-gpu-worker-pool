@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -142,16 +143,40 @@ async def inspect_runtime(profile: str, client: Any, base_url: str) -> dict[str,
     return versions
 
 
+def recipe_input_defaults(recipe_version: str) -> dict[str, Any]:
+    """The template defaults a profile's worker fills in for omitted inputs.
+
+    A recipe-bound worker attests its effective inputs, defaults included, so
+    the coordinator compares an omitted field with the recipe's default rather
+    than with nothing. Unknown recipes have none.
+    """
+    return dict(_recipe_input_defaults(recipe_version))
+
+
+@lru_cache(maxsize=8)
+def _recipe_input_defaults(recipe_version: str) -> tuple[tuple[str, Any], ...]:
+    for profile in (STANDARD, LIGHTX8):
+        if describe_profile(profile)['recipe_version'] == recipe_version:
+            capability = LIGHTX8_CAPABILITY if profile == LIGHTX8 else STANDARD_CAPABILITY
+            template = registry_for(profile).template(capability)
+            return tuple((entry.name, entry.default) for entry in template.inputs if entry.default is not None)
+    return ()
+
+
 class ProfileComfyPlugin(ComfyWorkflowPlugin):
     """Recheck the runtime for each job; a restart/config change fails closed."""
-    def __init__(self, profile: str, versions: dict[str, str], *, client: Any, base_url: str):
-        super().__init__(registry_for(profile), client=client, base_url=base_url)
+    def __init__(self, profile: str, versions: dict[str, str], *, client: Any, base_url: str, **runtime: Any):
+        # `runtime` carries the start command and startup timeout, so a profile
+        # job brings a stopped ComfyUI back exactly as a generic job would.
+        super().__init__(registry_for(profile), client=client, base_url=base_url, **runtime)
         self.profile = profile
         self.versions = versions
         self.profile_client = client
         self.profile_url = base_url
 
     async def execute(self, context, request):
+        # Inspection talks to ComfyUI, so it must be running first.
+        await self.ensure_running()
         actual = await inspect_runtime(self.profile, self.profile_client, self.profile_url)
         if actual != self.versions:
             raise ValueError('ComfyUI configuration changed; restart worker and resolve a new recipe')

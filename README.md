@@ -465,6 +465,23 @@ python -m outbound_gpu_worker_pool.agent_main
 | `OGWP_COMFY_START_COMMAND` | shell-split command, default unset | how to start the local runtime when it is down; unset means the agent fails the job instead |
 | `OGWP_COMFY_STARTUP_TIMEOUT_SECONDS` | seconds, default `180` | how long to wait for the runtime to answer healthy after starting it |
 
+**A machine profile can share the agent with other templates.** Setting
+`MVS_WORKER_PROFILE=h3-24gb-standard` on the `agent_main` entrypoint opts into a mixed mode:
+
+- Startup runs the standard profile check against the running ComfyUI (models, nodes, VRAM and
+  the optional last-frame input). A failed check starts no agent.
+- The worker registers the recipe, configuration and feature versions the check found, in place
+  of `OGWP_WORKER_RUNTIME_VERSIONS`.
+- `video.minimax_h3.text_to_video.v1` is served only by the profile plugin. It re-checks the
+  runtime before each job and attests the runtime versions and effective inputs it executed.
+- Every other approved template (Flux, dialogue) stays on `comfy-workflow`. That plugin's
+  registry has the profile's capability removed, and the agent refuses to start if any other
+  plugin still claims it.
+
+Only the standard profile can be mixed; the bounded 16GB recipe is refused. Without the
+variable the entrypoint behaves exactly as before. `build_agent_from_env` never reads the
+variable, so callers that wire their own profile plugin are unaffected.
+
 A coordinator publishes the same templates' schemas with
 `OGWP_CAPABILITY_PLUGINS=comfy-workflow`. It reads the packaged template directory for the
 schemas only and never opens a connection to any runtime.
