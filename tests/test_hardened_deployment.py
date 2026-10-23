@@ -78,11 +78,13 @@ def deployment():
             "HostConfig": {"ReadonlyRootfs": True, "CapDrop": ["ALL"],
                            "SecurityOpt": ["no-new-privileges"], "CgroupnsMode": "private",
                            "PidsLimit": 256, "Memory": 1024, "MemorySwap": 1024, "NanoCpus": 1000,
-                           "Init": True, "RestartPolicy": {"Name": "no"},
+                           "Init": True, "RestartPolicy": {"Name": "no"}, "IpcMode": "private",
                            "Tmpfs": {"/tmp": "size=1g,noexec,nosuid,nodev"}}, "Mounts": [],
             "NetworkSettings": {"Networks": {}}})
     agent, comfy, egress = containers
     agent["HostConfig"]["NetworkMode"] = "container:comfy"
+    agent["Mounts"] = [{"Type": "bind", "Destination": "/run/credentials/worker.json",
+                        "Source": approved["OGWP_WORKER_CREDENTIAL"], "RW": False}]
     agent["Config"]["Env"] = ["HTTPS_PROXY=http://egress:3128", "NO_PROXY=localhost,127.0.0.1,::1",
                               "OGWP_COMFY_URL=http://127.0.0.1:8188", "OGWP_WORKER_GPU_TELEMETRY=comfy"]
     comfy["HostConfig"]["Dns"] = ["127.0.0.1"]
@@ -94,7 +96,8 @@ def deployment():
     egress["Config"]["Env"] = ["OGWP_EGRESS_HOSTS=api.example.com"]
     egress["NetworkSettings"]["Networks"] = {"isolated": {}, "outbound": {}}
     networks = {"isolated": {"Internal": True, "Driver": "bridge",
-                "Options": {"com.docker.network.bridge.gateway_mode_ipv4": "isolated"},
+                "Options": {"com.docker.network.bridge.gateway_mode_ipv4": "isolated",
+                            "com.docker.network.bridge.gateway_mode_ipv6": "isolated"},
                 "Containers": {"comfy": {}, "egress": {}}}, "outbound": {}}
     return containers, networks, approved
 
@@ -102,13 +105,18 @@ def deployment():
 def test_complete_profile_and_prestart_gate():
     containers, networks, approved = deployment()
     assert gate.violations(containers, networks, approved=approved) == []
+    # Compose sets the IPC mode explicitly so the gate never depends on the daemon default.
+    compose = (Path(__file__).parents[1] / "deploy/hardened/compose.yaml").read_text()
+    assert "  ipc: private\n" in compose
     containers[0]["State"]["Running"] = False
     assert gate.violations(containers, networks, approved=approved)
     assert gate.violations(containers, networks, approved=approved, allow_stopped_agent=True) == []
 
 
 @pytest.mark.parametrize("change", ["host_mount", "host_gateway", "mutable_image", "extra_peer",
-                                    "unconfined", "unbounded_memory", "docker_restart"])
+                                    "unconfined", "unbounded_memory", "docker_restart", "shared_pid",
+                                    "shared_ipc", "host_ipc", "missing_models", "missing_credential",
+                                    "ipv6_gateway"])
 def test_configuration_drift_fails_closed(change):
     containers, networks, approved = deployment()
     if change == "host_mount":
@@ -125,6 +133,18 @@ def test_configuration_drift_fails_closed(change):
         containers[1]["HostConfig"]["Memory"] = 0
     elif change == "docker_restart":
         containers[0]["HostConfig"]["RestartPolicy"]["Name"] = "always"
+    elif change == "shared_pid":
+        containers[0]["HostConfig"]["PidMode"] = "container:comfy"
+    elif change == "shared_ipc":
+        containers[0]["HostConfig"]["IpcMode"] = "container:comfy"
+    elif change == "host_ipc":
+        containers[1]["HostConfig"]["IpcMode"] = "host"
+    elif change == "missing_models":
+        containers[1]["Mounts"] = []
+    elif change == "missing_credential":
+        containers[0]["Mounts"] = []
+    elif change == "ipv6_gateway":
+        networks["isolated"]["Options"]["com.docker.network.bridge.gateway_mode_ipv6"] = "nat"
     assert gate.violations(containers, networks, approved=approved)
 
 
@@ -205,3 +225,113 @@ async def test_proxy_denies_nonpublic_ipv6(monkeypatch, address):
     monkeypatch.setattr(asyncio.get_running_loop(), 'getaddrinfo', lookup)
     with pytest.raises(ValueError, match='nonpublic'):
         await proxy.public_addresses('api.example.com')
+
+
+def test_no_job_can_be_leased_before_both_probes_pass():
+    """The agent leases on start, so its probe runs in a one-off container first."""
+    script = (Path(__file__).parents[1] / "deploy/hardened/run.sh").read_text()
+    lines = [line for line in script.splitlines() if line and not line.startswith("#")]
+    start = next(i for i, line in enumerate(lines) if line.endswith(" start agent"))
+    agent_probe = next(i for i, line in enumerate(lines) if "OGWP_PROBE_ROLE=agent" in line)
+    comfy_probe = next(i for i, line in enumerate(lines) if "OGWP_PROBE_ROLE=comfy" in line)
+    prestart_gate = next(i for i, line in enumerate(lines) if "--allow-stopped-agent" in line)
+    assert max(agent_probe, comfy_probe, prestart_gate) < start
+    assert "run --rm -T --no-deps" in lines[agent_probe] and "--entrypoint python agent" in lines[agent_probe]
+    assert not any("exec" in line and "agent_id" in line for line in lines[start:])
+
+
+def hello(server_name):
+    """A real ClientHello from Python's TLS stack, as TLS records."""
+    import ssl
+    context = ssl.create_default_context()
+    context.check_hostname = server_name is not None
+    if server_name is None:
+        context.verify_mode = ssl.CERT_NONE
+    incoming, outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
+    connection = context.wrap_bio(incoming, outgoing, server_hostname=server_name)
+    with pytest.raises(ssl.SSLWantReadError):
+        connection.do_handshake()
+    return outgoing.read()
+
+
+async def records(data, *, split=None):
+    import asyncio
+    reader = asyncio.StreamReader()
+    if split:
+        # Re-frame the handshake across two TLS records, as a client may.
+        body = data[5:]
+        data = (b"\x16" + data[1:3] + split.to_bytes(2, "big") + body[:split]
+                + b"\x16" + data[1:3] + (len(body) - split).to_bytes(2, "big") + body[split:])
+    reader.feed_data(data)
+    reader.feed_eof()
+    return await proxy.read_client_hello(reader)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("split", [None, 40])
+async def test_the_tls_server_name_is_read_from_the_client_hello(split):
+    raw, body = await records(hello("api.example.com"), split=split)
+    assert proxy.client_hello_server_name(body) == "api.example.com"
+    assert raw.startswith(b"\x16")
+
+
+@pytest.mark.asyncio
+async def test_a_client_hello_without_a_server_name_is_refused():
+    _, body = await records(hello(None))
+    with pytest.raises(ValueError, match="SNI"):
+        proxy.client_hello_server_name(body)
+
+
+def test_an_encrypted_client_hello_is_refused():
+    import asyncio
+    _, body = asyncio.run(records(hello("api.example.com")))
+    # Append an encrypted_client_hello extension (0xfe0d) to the extension list.
+    position = 2 + 32
+    position += 1 + body[position]
+    position += 2 + int.from_bytes(body[position:position + 2], "big")
+    position += 1 + body[position]
+    length = int.from_bytes(body[position:position + 2], "big")
+    extension = b"\xfe\x0d\x00\x01\x00"
+    forged = (body[:position] + (length + len(extension)).to_bytes(2, "big")
+              + body[position + 2:position + 2 + length] + extension)
+    with pytest.raises(ValueError, match="encrypted SNI"):
+        proxy.client_hello_server_name(forged)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("server_name,relayed", [("api.example.com", True), ("other.example.net", False)])
+async def test_the_relay_only_tunnels_tls_to_the_connect_host(monkeypatch, server_name, relayed):
+    import asyncio
+    received = bytearray()
+
+    async def upstream_handler(reader, writer):
+        received.extend(await reader.read(65536))
+        writer.close()
+
+    upstream = await asyncio.start_server(upstream_handler, "127.0.0.1", 0)
+    port = upstream.sockets[0].getsockname()[1]
+
+    async def connect_public(host):
+        return await asyncio.open_connection("127.0.0.1", port)
+
+    monkeypatch.setattr(proxy, "connect_public", connect_public)
+    relay = proxy.Proxy(frozenset({"api.example.com"}))
+    server = await asyncio.start_server(relay.handle, "127.0.0.1", 0)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.sockets[0].getsockname()[1])
+        writer.write(b"CONNECT api.example.com:443 HTTP/1.1\r\n\r\n")
+        await writer.drain()
+        assert (await reader.readuntil(b"\r\n\r\n")).startswith(b"HTTP/1.1 200")
+        client_hello = hello(server_name)
+        writer.write(client_hello)
+        await writer.drain()
+        await asyncio.wait_for(reader.read(), 2)
+        writer.close()
+        await asyncio.sleep(0.05)
+        assert bytes(received) == (client_hello if relayed else b"")
+        assert relay.active == 0
+    finally:
+        server.close()
+        await server.wait_closed()
+        upstream.close()
+        await upstream.wait_closed()

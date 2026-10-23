@@ -27,10 +27,12 @@ python3 "$HERE/verify.py" --profile "$PROFILE" --models-only
 python3 "$HERE/verify.py" --profile "$PROFILE" --allow-stopped-agent
 comfy_id="$("${compose[@]}" ps -q comfy)"
 docker exec -i -e OGWP_PROBE_ROLE=comfy "$comfy_id" /opt/comfy/venv/bin/python - < "$HERE/probe.py"
+# The agent leases as soon as it starts, so its probe runs first in a one-off
+# container with the agent's configuration and a probe entrypoint: no job can be
+# leased until every check has passed.
+"${compose[@]}" run --rm -T --no-deps -e OGWP_PROBE_ROLE=agent --entrypoint python agent - < "$HERE/probe.py"
 "${compose[@]}" start agent
 python3 "$HERE/verify.py" --profile "$PROFILE"
-agent_id="$("${compose[@]}" ps -q agent)"
-docker exec -i -e OGWP_PROBE_ROLE=agent "$agent_id" python - < "$HERE/probe.py"
 echo "GPU isolation verified; worker is running under the gated supervisor."
 while sleep 30; do
   result="$(python3 "$HERE/verify.py" --profile "$PROFILE")" || { printf '%s\n' "$result" >&2; exit 1; }

@@ -45,6 +45,7 @@ def main():
         "code_write_denied": denied_write("/opt/comfy" if role == "comfy" else "/opt/ogwp"),
         "metadata_route_denied": blocked_connection("169.254.169.254", 80),
         "direct_internet_denied": blocked_connection("1.1.1.1", 443),
+        "direct_internet_ipv6_denied": blocked_connection("2606:4700:4700::1111", 443),
         "host_bridge_route_denied": blocked_connection("172.17.0.1", 22),
     }
     try:

@@ -12,6 +12,7 @@ import re
 import subprocess
 
 SERVICES = {"agent", "comfy", "egress"}
+REQUIRED_MOUNTS = {"agent": {"/run/credentials/worker.json"}, "comfy": {"/opt/comfy/models"}}
 MOUNTS = {
     "agent": {"/run/credentials/worker.json"},
     "comfy": {"/opt/comfy/models", "/usr/lib/wsl/lib", "/usr/lib/wsl/drivers"},
@@ -49,7 +50,10 @@ def violations(containers: list[dict], networks: dict[str, dict], *, allow_stopp
         require(any(x in opts for x in ["no-new-privileges:true", "no-new-privileges"]), "no-new-privileges required")
         require(set(opts) <= {"no-new-privileges:true", "no-new-privileges"}, "security profile overrides forbidden")
         require(not host.get("PortBindings") and not host.get("PublishAllPorts"), "published ports forbidden")
-        require(host.get("PidMode") != "host" and host.get("IpcMode") != "host", "host process namespaces forbidden")
+        # Only the container's own namespaces: "container:<id>" would join another
+        # workload's processes or shared memory just as "host" joins the host's.
+        require(host.get("PidMode", "") == "" and host.get("IpcMode") == "private",
+                "private process and IPC namespaces required")
         require(host.get("NetworkMode") != "host", "host networking forbidden")
         require(host.get("CgroupnsMode") == "private", "private cgroup namespace required")
         require(0 < host.get("PidsLimit", 0) <= 256, "PID bound missing or excessive")
@@ -67,6 +71,9 @@ def violations(containers: list[dict], networks: dict[str, dict], *, allow_stopp
             require(name == "comfy" and device.get("PathOnHost") == "/dev/dxg"
                     and device.get("PathInContainer") == "/dev/dxg"
                     and device.get("CgroupPermissions") == "rw", "unreviewed device mount")
+        present = {m.get("Destination") for m in c.get("Mounts", []) if m.get("Type") != "tmpfs"}
+        # Verified model bytes mean nothing unless the runtime actually loads them.
+        require(REQUIRED_MOUNTS.get(name, set()) <= present, "required host mount missing")
         for mount in c.get("Mounts", []):
             if mount.get("Type") == "tmpfs":
                 continue
@@ -100,8 +107,10 @@ def violations(containers: list[dict], networks: dict[str, dict], *, allow_stopp
             require(len(attached) == 1, "ComfyUI must have exactly one network")
             for network_name in attached:
                 network = networks.get(network_name, {})
+                options = network.get("Options", {})
                 require(network.get("Internal") is True and network.get("Driver") == "bridge"
-                        and network.get("Options", {}).get("com.docker.network.bridge.gateway_mode_ipv4") == "isolated",
+                        and options.get("com.docker.network.bridge.gateway_mode_ipv4") == "isolated"
+                        and options.get("com.docker.network.bridge.gateway_mode_ipv6") == "isolated",
                         "network must deny external routes and host gateway access")
             require(host.get("Dns") == ["127.0.0.1"], "external DNS forwarding forbidden")
             require(c.get("State", {}).get("Health", {}).get("Status") == "healthy", "runtime is not healthy")

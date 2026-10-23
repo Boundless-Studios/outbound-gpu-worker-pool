@@ -7,6 +7,8 @@ x-sandbox: &sandbox
   cap_drop: [ALL]
   security_opt: [no-new-privileges:true]
   pids_limit: 256
+  # Explicit so the gate can require it whatever the daemon's default IPC mode.
+  ipc: private
   init: true
   # The gated supervisor owns restarts, including after a host reboot.
   restart: "no"
