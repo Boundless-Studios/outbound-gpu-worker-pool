@@ -1,0 +1,120 @@
+# Images must be approved immutable digests (checked by verify.py).
+# Docker Engine >=28 is required for isolated bridge gateway mode.
+name: ogwp-hardened
+x-sandbox: &sandbox
+  user: "65532:65532"
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  pids_limit: 256
+  init: true
+  # The gated supervisor owns restarts, including after a host reboot.
+  restart: "no"
+  logging:
+    driver: json-file
+    options: {max-size: 10m, max-file: "2"}
+services:
+  egress:
+    <<: *sandbox
+    image: ${OGWP_AGENT_IMAGE:?approved immutable agent image required}
+    entrypoint: [python, /opt/ogwp/egress_proxy.py]
+    environment:
+      OGWP_EGRESS_HOSTS: ${OGWP_EGRESS_HOSTS:?exact outbound HTTPS hosts required}
+      PYTHONDONTWRITEBYTECODE: "1"
+    networks: [workload, internet]
+    mem_limit: 128m
+    memswap_limit: 128m
+    cpus: 0.5
+    tmpfs: ["/tmp:size=16m,mode=1777,noexec,nosuid,nodev"]
+  comfy:
+    <<: *sandbox
+    image: ${OGWP_COMFY_IMAGE:?approved immutable ComfyUI image required}
+    entrypoint:
+      - /opt/comfy/venv/bin/python
+      - -c
+      - "import os,sys; [os.makedirs('/scratch/'+p,exist_ok=True) for p in ('input','output','temp','user','cache')]; os.makedirs('/jit/tmp',exist_ok=True); os.execv(sys.executable,[sys.executable,'/opt/comfy/main.py',*sys.argv[1:]])"
+    command: [--listen, "127.0.0.1", --port, "8188", --disable-auto-launch,
+      --input-directory, /scratch/input, --output-directory, /scratch/output,
+      --temp-directory, /scratch/temp, --user-directory, /scratch/user,
+      --disable-pinned-memory,
+      --disable-all-custom-nodes, --disable-api-nodes]
+    working_dir: /opt/comfy
+    environment:
+      HOME: /scratch
+      XDG_CACHE_HOME: /scratch/cache
+      TMPDIR: /jit/tmp
+      TRITON_CACHE_DIR: /jit/triton
+      TORCHINDUCTOR_CACHE_DIR: /jit/torch
+      CUDA_CACHE_PATH: /jit/cuda
+      PYTHONDONTWRITEBYTECODE: "1"
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    # No default route, no host bridge address, no external DNS forwarding.
+    networks: [workload]
+    dns: [127.0.0.1]
+    mem_limit: ${OGWP_COMFY_MEMORY:-24g}
+    memswap_limit: ${OGWP_COMFY_MEMORY:-24g}
+    cpus: ${OGWP_COMFY_CPUS:-8}
+    shm_size: 1g
+    tmpfs:
+      - /scratch:size=4g,uid=65532,gid=65532,mode=0700,noexec,nosuid,nodev
+      # GPU compilers must mmap generated shared objects. Only this bounded,
+      # disposable cache is executable; source/models remain immutable.
+      - /jit:size=512m,uid=65532,gid=65532,mode=0700,exec,nosuid,nodev
+      - /tmp:size=256m,mode=1777,noexec,nosuid,nodev
+      - /home:size=1m,mode=0755,noexec,nosuid,nodev
+    volumes:
+      - type: bind
+        source: ${OGWP_MODELS_DIR:?read-only curated models directory required}
+        target: /opt/comfy/models
+        read_only: true
+        bind: {create_host_path: false}
+    healthcheck:
+      test: [CMD, /opt/comfy/venv/bin/python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8188/system_stats', timeout=3).close()"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+  agent:
+    <<: *sandbox
+    image: ${OGWP_AGENT_IMAGE:?approved immutable agent image required}
+    entrypoint: [python, -m, outbound_gpu_worker_pool.agent_main]
+    # Shares only the network namespace, never PID/filesystem/credentials.
+    network_mode: service:comfy
+    depends_on:
+      comfy: {condition: service_healthy}
+      egress: {condition: service_started}
+    env_file: ${OGWP_AGENT_ENV:?private agent environment file required}
+    environment:
+      HOME: /scratch
+      PYTHONDONTWRITEBYTECODE: "1"
+      HTTPS_PROXY: http://egress:3128
+      HTTP_PROXY: http://egress:3128
+      NO_PROXY: localhost,127.0.0.1,::1
+      OGWP_COMFY_URL: http://127.0.0.1:8188
+      OGWP_COMFY_START_COMMAND: ""
+      OGWP_COMFY_TEMPLATES_DIR: /opt/ogwp/templates
+      OGWP_WORKER_WORKSPACE: /scratch/jobs
+      OGWP_WORKER_CONCURRENCY: "1"
+      OGWP_WORKER_GPU_TELEMETRY: comfy
+      GOOGLE_APPLICATION_CREDENTIALS: /run/credentials/worker.json
+    mem_limit: 1g
+    memswap_limit: 1g
+    cpus: 2
+    stop_grace_period: 25m
+    tmpfs:
+      - /scratch:size=3g,uid=65532,gid=65532,mode=0700,noexec,nosuid,nodev
+      - /tmp:size=64m,mode=1777,noexec,nosuid,nodev
+    volumes:
+      - type: bind
+        source: ${OGWP_WORKER_CREDENTIAL:?dedicated worker-only credential required}
+        target: /run/credentials/worker.json
+        read_only: true
+        bind: {create_host_path: false}
+networks:
+  workload:
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
+      com.docker.network.bridge.gateway_mode_ipv6: isolated
+  internet: {}

@@ -10,6 +10,11 @@ inbound call to a worker, ever.
 
 ## Trust model
 
+For production GPU machines use the [isolated deployment profile](deploy/hardened/README.md).
+Outbound requests and loopback binding do not isolate model execution from a
+personal account. The profile enforces container, filesystem and network
+boundaries, gates startup, and checks for drift while the agent runs.
+
 - **The coordinator never calls a worker.** Every lease, heartbeat, and commit is an outbound
   request the worker makes and the coordinator authenticates.
 - **A worker holds one credential and nothing else.** No bucket key, no database URL, no
@@ -360,9 +365,10 @@ SIGTERM and SIGINT drain: the in-flight job finishes, a final draining heartbeat
 the process exits 0. A lease taken as draining begins is released back to the pool rather than
 started.
 
-To put the agent on a real Linux machine — one script, a systemd *user* unit, and a check that
-proves the box exposes nothing new — see [`docs/operations.md`](docs/operations.md) and
-`deploy/agent/`.
+For production GPU deployment use [`deploy/hardened`](deploy/hardened/README.md),
+which verifies isolation before leasing and monitors configuration drift.
+[`docs/operations.md`](docs/operations.md) retains the explicitly opted-in
+same-user development setup; a socket check alone does not certify a host.
 
 Writing your own plugin means implementing `GpuExecutorPlugin` — `capabilities()`,
 `validate(lease)`, `execute(context, request)`, `cancel(job_id)`, `health()` — and naming it in

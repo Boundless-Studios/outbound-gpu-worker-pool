@@ -37,6 +37,7 @@ from outbound_gpu_worker_pool.plugins import (
     DeterministicEchoPlugin,
     GpuExecutorPlugin,
 )
+from outbound_gpu_worker_pool.gpu_sampler import ComfyGpuSampler
 
 STATIC_AUTH = "static"
 GOOGLE_OIDC_AUTH = "google_oidc"
@@ -151,6 +152,11 @@ def build_agent_from_env(
             str(Path(tempfile.gettempdir()) / DEFAULT_WORKSPACE_NAME),
         )
     )
+    telemetry = environment.get("OGWP_WORKER_GPU_TELEMETRY", "nvidia-smi")
+    if telemetry not in {"nvidia-smi", "comfy"}:
+        raise ValueError("unsupported OGWP_WORKER_GPU_TELEMETRY")
+    gpu_sampler = (ComfyGpuSampler(environment.get("OGWP_COMFY_URL", "http://127.0.0.1:8188"))
+                   if telemetry == "comfy" else None)
     return WorkerAgent(
         coordinator_url=coordinator_url,
         worker_id=worker_id,
@@ -169,6 +175,7 @@ def build_agent_from_env(
         tenant_id=environment.get("OGWP_WORKER_TENANT") or None,
         gpu_model=environment.get("OGWP_WORKER_GPU_MODEL"),
         vram_mb=int(vram_mb) if vram_mb else None,
+        gpu_sampler=gpu_sampler,
     )
 
 

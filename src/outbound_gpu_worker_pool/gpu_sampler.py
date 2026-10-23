@@ -11,6 +11,9 @@ import logging
 import os
 import shutil
 import subprocess
+import asyncio
+import json
+from urllib.parse import urlsplit
 from collections.abc import Callable, Sequence
 
 from outbound_gpu_worker_pool.contracts import GpuTelemetry
@@ -91,6 +94,65 @@ class GpuSampler:
             return
         self._warned = True
         logger.warning("gpu telemetry sampling disabled: %s", message)
+
+
+class ComfyGpuSampler(GpuSampler):
+    """Bounded loopback telemetry without giving the agent a GPU device.
+
+    ComfyUI reports memory but not utilization. Never invent a utilization value.
+    Network, redirects, response size and total wall time are bounded because
+    the runtime's response is untrusted, even on the local machine.
+    """
+
+    def __init__(self, base_url: str, *, timeout_seconds: float = 3.0) -> None:
+        super().__init__(timeout_seconds=timeout_seconds)
+        url = urlsplit(base_url)
+        if (url.scheme != "http" or url.hostname not in {"localhost", "127.0.0.1", "::1"}
+                or url.username or url.password or url.query or url.fragment
+                or url.path not in {"", "/"}):
+            raise ValueError("ComfyUI telemetry requires a loopback HTTP origin")
+        self._url = base_url.rstrip("/") + "/system_stats"
+
+    def sample(self) -> tuple[GpuTelemetry, ...]:
+        try:
+            return asyncio.run(self._sample())
+        except Exception:
+            self._warn_once("ComfyUI telemetry unavailable")
+            return ()
+
+    async def _sample(self) -> tuple[GpuTelemetry, ...]:
+        import httpx
+        async with asyncio.timeout(self._timeout_seconds):
+            async with httpx.AsyncClient(trust_env=False, follow_redirects=False) as client:
+                async with client.stream("GET", self._url, headers={"Accept-Encoding": "identity"}) as response:
+                    response.raise_for_status()
+                    raw = bytearray()
+                    async for chunk in response.aiter_raw(chunk_size=16384):
+                        raw.extend(chunk)
+                        if len(raw) > 65536:
+                            raise ValueError("telemetry response too large")
+        return _parse_comfy_stats(json.loads(raw))
+
+
+def _parse_comfy_stats(document: dict) -> tuple[GpuTelemetry, ...]:
+    devices = document["devices"]
+    if not isinstance(devices, list) or len(devices) > 16:
+        raise ValueError("invalid GPU device list")
+    result = []
+    for device in devices:
+        if device.get("type") != "cuda":
+            continue
+        total, free, index = device["vram_total"], device["vram_free"], device["index"]
+        if (any(type(v) is not int for v in [total, free, index])
+                or not 0 <= free <= total <= 2**50 or not 0 <= index < 16):
+            raise ValueError("invalid GPU memory or index")
+        name = device["name"]
+        if not isinstance(name, str) or not 1 <= len(name) <= 256:
+            raise ValueError("invalid GPU name")
+        result.append(GpuTelemetry(index=index, name=name, utilization_pct=None,
+                                   memory_used_mb=(total - free) // 2**20,
+                                   memory_total_mb=total // 2**20))
+    return tuple(result)
 
 
 def _parse_csv(stdout: str) -> tuple[GpuTelemetry, ...]:

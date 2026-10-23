@@ -1,0 +1,16 @@
+# Build from reviewed source at code/ and a frozen Linux virtualenv at venv/.
+# Models, user state, credentials and Git directories must not be in the context.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.12 python3.12-dev gcc libc6-dev libgl1 libglib2.0-0 libgomp1 \
+    libsndfile1 ca-certificates ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+COPY code /opt/comfy
+COPY venv /opt/comfy/venv
+RUN ln -sfn /usr/bin/python3.12 /opt/comfy/venv/bin/python \
+    && ln -sfn /usr/bin/python3.12 /opt/comfy/venv/bin/python3 \
+    && ln -sfn /usr/bin/python3.12 /opt/comfy/venv/bin/python3.12
+ENV PYTHONDONTWRITEBYTECODE=1
+WORKDIR /opt/comfy
+USER 65532:65532

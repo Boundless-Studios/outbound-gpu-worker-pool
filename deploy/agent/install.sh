@@ -11,6 +11,13 @@
 #   OGWP_PYTHON  interpreter to build the venv with, must be 3.13+ (default python3)
 set -euo pipefail
 
+if [[ "${OGWP_ALLOW_UNSANDBOXED:-}" != "1" ]]; then
+    echo "The legacy same-user installer is for trusted development only." >&2
+    echo "Use deploy/hardened for production GPU isolation." >&2
+    echo "To explicitly accept the development-only boundary, set OGWP_ALLOW_UNSANDBOXED=1." >&2
+    exit 2
+fi
+
 OGWP_HOME="${OGWP_HOME:-$HOME/.local/share/outbound-gpu-worker}"
 OGWP_REF="${OGWP_REF:-main}"
 OGWP_PYTHON="${OGWP_PYTHON:-python3}"

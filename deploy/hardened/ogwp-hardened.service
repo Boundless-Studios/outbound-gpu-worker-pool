@@ -1,0 +1,20 @@
+[Unit]
+Description=Gated isolated outbound GPU worker
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+Type=simple
+ExecStart=/bin/bash %h/.local/share/ogwp-hardened/hardened/run.sh
+Restart=on-failure
+RestartSec=30
+# Signal the supervisor; its EXIT handler drains the agent before ComfyUI stops.
+KillMode=process
+TimeoutStopSec=27min
+UMask=0077
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

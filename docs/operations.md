@@ -1,5 +1,10 @@
 # Running a worker machine
 
+For production use the [isolated deployment profile](../deploy/hardened/README.md).
+The same-user installation below is retained for trusted development only and
+requires `OGWP_ALLOW_UNSANDBOXED=1`. Its socket check does not certify host or
+workload isolation; do not use it as a production security gate.
+
 How to put the agent on a Linux GPU box, prove the box exposes nothing new, and keep it
 running. The first target is Ubuntu 24.04 (including WSL2), where ComfyUI is a native venv
 install rather than a container.
@@ -28,7 +33,7 @@ to open: the agent dials out to the coordinator and nothing ever dials in.
 ```bash
 git clone https://github.com/Boundless-Studios/outbound-gpu-worker-pool
 cd outbound-gpu-worker-pool
-OGWP_PYTHON=python3.13 ./deploy/agent/install.sh
+OGWP_ALLOW_UNSANDBOXED=1 OGWP_PYTHON=python3.13 ./deploy/agent/install.sh
 ```
 
 It creates `~/.local/share/outbound-gpu-worker/` with a venv, a `workspace/` for per-job
@@ -119,7 +124,7 @@ To stop taking work without stopping the process, the coordinator side sets
 ## Upgrade
 
 ```bash
-OGWP_REF=<sha> ./deploy/agent/install.sh
+OGWP_ALLOW_UNSANDBOXED=1 OGWP_REF=<sha> ./deploy/agent/install.sh
 systemctl --user restart outbound-gpu-worker
 ```
 

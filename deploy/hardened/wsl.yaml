@@ -1,0 +1,18 @@
+# WSL GPU access only; never mount the Windows filesystem or Docker socket.
+services:
+  comfy:
+    devices: [/dev/dxg:/dev/dxg:rw]
+    environment:
+      LD_LIBRARY_PATH: /usr/lib/wsl/lib
+      TRITON_LIBCUDA_PATH: /usr/lib/wsl/lib
+    volumes:
+      - type: bind
+        source: /usr/lib/wsl/lib
+        target: /usr/lib/wsl/lib
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: /usr/lib/wsl/drivers
+        target: /usr/lib/wsl/drivers
+        read_only: true
+        bind: {create_host_path: false}

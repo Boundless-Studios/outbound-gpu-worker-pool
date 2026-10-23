@@ -1,0 +1,11 @@
+# Build context: a clean library export plus approved-templates/.
+# Supply an approved Python 3.13 base image by full digest.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+WORKDIR /opt/ogwp/source
+COPY pyproject.toml README.md ./
+COPY src ./src
+RUN pip install --no-cache-dir '.[agent,comfy,google-auth]' && pip check
+COPY approved-templates /opt/ogwp/templates
+COPY deploy/hardened/egress_proxy.py /opt/ogwp/egress_proxy.py
+USER 65532:65532

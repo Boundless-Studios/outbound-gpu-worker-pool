@@ -120,6 +120,10 @@ def test_the_comfy_startup_timeout_is_configurable_from_the_environment() -> Non
             STATIC_ENVIRONMENT | {"OGWP_WORKER_AUTH": "mutual_tls"},
             id="unknown-auth-method",
         ),
+        pytest.param(
+            STATIC_ENVIRONMENT | {"OGWP_WORKER_GPU_TELEMETRY": "unknown"},
+            id="unknown-telemetry-method",
+        ),
     ],
 )
 def test_b_incomplete_configuration_is_rejected(environment: dict[str, str]) -> None:

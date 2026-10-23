@@ -11,6 +11,55 @@ import pytest
 
 from outbound_gpu_worker_pool.contracts import GpuTelemetry
 from outbound_gpu_worker_pool.gpu_sampler import GpuSampler
+from outbound_gpu_worker_pool.gpu_sampler import ComfyGpuSampler, _parse_comfy_stats
+
+
+def test_comfy_telemetry_reports_memory_without_fabricating_utilization():
+    result = _parse_comfy_stats({"devices": [{"type": "cuda", "index": 0,
+        "name": "Test GPU", "vram_total": 8 * 2**30, "vram_free": 6 * 2**30}]})
+    assert result == (GpuTelemetry(0, "Test GPU", None, 2048, 8192),)
+
+
+@pytest.mark.parametrize("origin", ["http://169.254.169.254", "https://example.com",
+                                    "http://localhost@evil.test", "http://localhost/path"])
+def test_comfy_telemetry_rejects_nonloopback_origins(origin):
+    with pytest.raises(ValueError):
+        ComfyGpuSampler(origin)
+
+
+def test_comfy_telemetry_rejects_malformed_memory():
+    with pytest.raises(ValueError):
+        _parse_comfy_stats({"devices": [{"type": "cuda", "index": 0, "name": "GPU",
+                                        "vram_total": 1, "vram_free": 2}]})
+
+
+def test_comfy_telemetry_failure_is_nonfatal(monkeypatch):
+    sampler = ComfyGpuSampler("http://127.0.0.1:8188")
+    async def fail():
+        raise TimeoutError
+    monkeypatch.setattr(sampler, "_sample", fail)
+    assert sampler.sample() == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["oversize", "slow", "redirect"])
+async def test_comfy_network_budget_and_redirect_policy(monkeypatch, mode):
+    import asyncio
+    import httpx
+    original = httpx.AsyncClient
+    class Stream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            if mode == "slow":
+                await asyncio.sleep(1)
+            yield b"x" * 65537
+    def handler(request):
+        if mode == "redirect":
+            return httpx.Response(302, headers={"Location": "http://169.254.169.254"})
+        return httpx.Response(200, stream=Stream())
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original(transport=httpx.MockTransport(handler), **kwargs))
+    sampler = ComfyGpuSampler("http://127.0.0.1:8188", timeout_seconds=0.05)
+    with pytest.raises((ValueError, TimeoutError, httpx.HTTPStatusError)):
+        await sampler._sample()
 
 SAMPLE_CSV = (
     "0, NVIDIA GeForce RTX 4090, 45, 2048, 24576\n"
