@@ -872,6 +872,34 @@ async def test_a_heartbeat_reports_the_job_the_agent_is_executing(
         assert harness.agent._busy_job_id is None
 
 
+async def test_a_worker_executing_a_job_stays_present_as_busy(
+    tmp_path: Path,
+) -> None:
+    # A render longer than the online window must read BUSY, not OFFLINE: the
+    # agent refreshes its own presence alongside each job heartbeat.
+    plugin = _BlockingPlugin()
+    async with _harness(
+        tmp_path / "workspaces",
+        plugins=(plugin,),
+        gpu_sampler=_StaticGpuSampler(()),  # type: ignore[arg-type]
+    ) as harness:
+        submitted = await harness.submit()
+
+        run_task = asyncio.create_task(harness.agent.run_once())
+        try:
+            await asyncio.wait_for(plugin.started.wait(), timeout=5.0)
+            for _ in range(20):
+                record = await harness.registry.get("worker-a")
+                if record is not None and record.busy_job_id == submitted.job_id:
+                    break
+                await asyncio.sleep(0)
+            assert record is not None
+            assert record.busy_job_id == submitted.job_id
+        finally:
+            plugin.release.set()
+            await run_task
+
+
 async def test_gpu_sampling_never_raises_out_of_a_heartbeat(tmp_path: Path) -> None:
     class _ExplodingSampler:
         def sample(self) -> tuple[GpuTelemetry, ...]:

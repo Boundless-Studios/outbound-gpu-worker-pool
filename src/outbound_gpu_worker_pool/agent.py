@@ -429,6 +429,16 @@ class WorkerAgent:
                     "worker job heartbeat did not reach the coordinator",
                     extra={"job_id": lease.job_id, "worker_id": self.worker_id},
                 )
+            # Presence is only otherwise refreshed between leases. Without it a worker
+            # executing a job longer than the online window reads OFFLINE rather than
+            # BUSY to every host watching the pool.
+            try:
+                await self.heartbeat()
+            except httpx.HTTPError:
+                logger.debug(
+                    "worker presence heartbeat did not reach the coordinator",
+                    extra={"job_id": lease.job_id, "worker_id": self.worker_id},
+                )
 
     async def _reject(self, lease: LeaseGrant, reason: str) -> AgentOutcome:
         await self._fail(
