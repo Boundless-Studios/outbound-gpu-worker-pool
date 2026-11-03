@@ -484,6 +484,23 @@ profiles can be mixed; the bounded 16GB recipe is refused. Without the
 variable the entrypoint behaves exactly as before. `build_agent_from_env` never reads the
 variable, so callers that wire their own profile plugin are unaffected.
 
+**One runtime can serve several profiles.** Give `MVS_WORKER_PROFILE` a comma-separated
+list, for example `h3-24gb-standard,flux2-klein-subject-12gb`.
+
+- Every profile is checked at startup, and a failure in any one of them starts no agent.
+- Each capability runs only through its own profile plugin.
+- The first profile registers the plain `magic_recipe` and `magic_config` keys. A
+  single-profile worker registers exactly the same keys, so jobs pinned before keep matching.
+- Each further profile registers `magic_recipe@<profile>`, `magic_config@<profile>` and
+  `magic_profile@<profile>`, plus its features under the same suffix. A job for that profile
+  pins the namespaced keys, and its plugin attests them.
+- The coordinator attests whichever recipe a job pinned. It compares the effective inputs
+  that the profile declares (`MachineProfile.attested_inputs`).
+
+Profiles are entries in `machine_profiles.PROFILES`. Each entry gives the profile's
+capability, its template directory, a fingerprinted description, its attested inputs and its
+launch-flag check. Adding a profile does not change any existing recipe version.
+
 A coordinator publishes the same templates' schemas with
 `OGWP_CAPABILITY_PLUGINS=comfy-workflow`. It reads the packaged template directory for the
 schemas only and never opens a connection to any runtime.
