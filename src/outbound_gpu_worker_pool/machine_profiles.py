@@ -1,6 +1,7 @@
 """Explicit machine recipes; never inferred from VRAM alone.
 
-The bounded 16GB graph is opt-in, outside the standard template directory.
+The bounded 16GB graph and the 12GB subject-image graph are opt-in, outside the
+standard template directory.
 A profile's fingerprint binds discovery, lease eligibility and execution.
 Optional features are separate runtime versions, outside that fingerprint, so
 declaring one never makes an already-registered worker ineligible for the
@@ -18,18 +19,28 @@ from .comfy import PACKAGED_TEMPLATES_DIRECTORY, TemplateRegistry, ComfyWorkflow
 
 LIGHTX8 = 'h3-16gb-lightx8'
 STANDARD = 'h3-24gb-standard'
+# Subject images only: the standard Klein v2 graph, fixed at 1024², 20 steps and
+# at most three references, under its own capability so a 12GB card never leases
+# a 16GB subject job.
+SUBJECT12 = 'flux2-klein-subject-12gb'
 RECIPE_KEY = 'magic_recipe'
 CONFIG_KEY = 'magic_config'
 PROFILE_DIRECTORY = PACKAGED_TEMPLATES_DIRECTORY / 'machine_profiles'
 LIGHTX8_CAPABILITY = 'video.minimax_h3.text_to_video.w4a8_16gb.lightx8.v1'
 STANDARD_CAPABILITY = 'video.minimax_h3.text_to_video.v1'
+SUBJECT12_CAPABILITY = 'image.flux2_klein.subject.12gb.v1'
+PROFILE_CAPABILITIES = {LIGHTX8: LIGHTX8_CAPABILITY, STANDARD: STANDARD_CAPABILITY,
+                        SUBJECT12: SUBJECT12_CAPABILITY}
+# Flags that keep every model resident; the 12GB subject measurement ran without them.
+SUBJECT12_REFUSED_FLAGS = ('--gpu-only', '--highvram')
 # Closed-loop (first frame == last frame) conditioning, required only by such jobs.
 LAST_FRAME_FEATURE_KEY = 'magic_feature_last_frame'
 
 
 def registry_for(profile: str) -> TemplateRegistry:
-    if profile == LIGHTX8:
-        return TemplateRegistry.from_directory(PROFILE_DIRECTORY)
+    if profile in (LIGHTX8, SUBJECT12):
+        bounded = TemplateRegistry.from_directory(PROFILE_DIRECTORY)
+        return TemplateRegistry([bounded.template(PROFILE_CAPABILITIES[profile])])
     if profile == STANDARD:
         standard = TemplateRegistry.from_directory(PACKAGED_TEMPLATES_DIRECTORY)
         return TemplateRegistry([standard.template(STANDARD_CAPABILITY)])
@@ -38,12 +49,39 @@ def registry_for(profile: str) -> TemplateRegistry:
 
 def describe_profile(profile: str) -> dict[str, Any]:
     registry = registry_for(profile)
-    capability = LIGHTX8_CAPABILITY if profile == LIGHTX8 else STANDARD_CAPABILITY
+    capability = PROFILE_CAPABILITIES[profile]
     template = registry.template(capability)
     graph = template.graph
     models = sorted({str(v) for node in graph.values() for k, v in node['inputs'].items()
                      if k in {'unet_name', 'clip_name', 'vae_name', 'lora_name'}})
-    description = {
+    if profile == SUBJECT12:
+        description = _subject12_description(template, models)
+    else:
+        description = _video_description(profile, capability, template, models)
+    fingerprint = hashlib.sha256(json.dumps({'description': description, 'graph': graph},
+                                           sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    return {**description, 'recipe_version': fingerprint}
+
+
+def _subject12_description(template, models: list[str]) -> dict[str, Any]:
+    return {
+        'profile': SUBJECT12, 'capability_id': SUBJECT12_CAPABILITY,
+        'template_version': template.template_version,
+        'models': models, 'steps': 20, 'min_vram_mb': 12000,
+        'sampler': 'euler', 'scheduler': 'Flux2Scheduler',
+        'diffusion_precision': 'FP8 (stored)', 'text_encoder_precision': 'BF16',
+        'bounds': {'width': 1024, 'height': 1024, 'references': len(template.image_slots)},
+        'refused_flags': list(SUBJECT12_REFUSED_FLAGS),
+        'evidence': 'RTX 4090 with VRAM held to 11,914 MiB free (and 10,900 MiB): 0, 1 and 3 '
+                    'references at 1024x1024, 20 steps, byte-identical to the v2 graph, peak '
+                    '10,218 MiB, worst 23.4 s; 2 references and a physical 12GB card unmeasured',
+    }
+
+
+def _video_description(profile: str, capability: str, template, models: list[str]) -> dict[str, Any]:
+    # These fields and values are fingerprinted: changing any of them makes every
+    # registered worker of the profile ineligible for the jobs it serves.
+    return {
         'profile': profile, 'capability_id': capability,
         'template_version': template.template_version,
         'models': models, 'steps': 8 if profile == LIGHTX8 else 20,
@@ -63,9 +101,6 @@ def describe_profile(profile: str) -> dict[str, Any]:
         'evidence': 'RTX 4080 walk comparison; user selected B' if profile == LIGHTX8
                     else 'Existing standard template; no 24GB benchmark established',
     }
-    fingerprint = hashlib.sha256(json.dumps({'description': description, 'graph': graph},
-                                           sort_keys=True, separators=(',', ':')).encode()).hexdigest()
-    return {**description, 'recipe_version': fingerprint}
 
 
 def profile_features(profile: str, object_info: dict[str, Any]) -> dict[str, str]:
@@ -118,6 +153,9 @@ async def inspect_runtime(profile: str, client: Any, base_url: str) -> dict[str,
         raise ValueError('No CUDA GPU with enough VRAM for the configured profile')
     system = stats['system']
     argv = system.get('argv', [])
+    if profile == SUBJECT12 and any(flag in argv for flag in SUBJECT12_REFUSED_FLAGS):
+        raise ValueError('12GB subject recipe refuses --gpu-only and --highvram; '
+                         'it was measured with models offloaded between stages')
     if profile == LIGHTX8:
         required = ['--use-sage-attention', '--enable-dynamic-vram', '--fast-disk', '--disable-pinned-memory']
         if any(flag not in argv for flag in required) or '--reserve-vram' not in argv:
@@ -155,10 +193,9 @@ def recipe_input_defaults(recipe_version: str) -> dict[str, Any]:
 
 @lru_cache(maxsize=8)
 def _recipe_input_defaults(recipe_version: str) -> tuple[tuple[str, Any], ...]:
-    for profile in (STANDARD, LIGHTX8):
+    for profile in (STANDARD, LIGHTX8, SUBJECT12):
         if describe_profile(profile)['recipe_version'] == recipe_version:
-            capability = LIGHTX8_CAPABILITY if profile == LIGHTX8 else STANDARD_CAPABILITY
-            template = registry_for(profile).template(capability)
+            template = registry_for(profile).template(PROFILE_CAPABILITIES[profile])
             return tuple((entry.name, entry.default) for entry in template.inputs if entry.default is not None)
     return ()
 

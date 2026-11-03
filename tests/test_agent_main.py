@@ -232,11 +232,39 @@ async def test_mixed_mode_keeps_flux_and_dialogue_and_binds_h3_to_the_profile(
 
 
 async def test_mixed_mode_refuses_the_bounded_profile(verified_standard) -> None:
-    with pytest.raises(ValueError, match="only h3-24gb-standard"):
+    with pytest.raises(ValueError, match="only h3-24gb-standard or flux2-klein-subject-12gb"):
         await agent_main.prepare_mixed_profile(
             STATIC_ENVIRONMENT | {"MVS_WORKER_PROFILE": "h3-16gb-lightx8"}
         )
     assert verified_standard == []
+
+
+async def test_mixed_mode_binds_the_12gb_subject_profile_beside_the_generic_templates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from outbound_gpu_worker_pool import machine_profiles
+    from outbound_gpu_worker_pool.machine_profiles import (
+        CONFIG_KEY, RECIPE_KEY, SUBJECT12, SUBJECT12_CAPABILITY, ProfileComfyPlugin, describe_profile,
+    )
+
+    versions = {RECIPE_KEY: describe_profile(SUBJECT12)["recipe_version"], CONFIG_KEY: "c" * 64}
+
+    async def prepare(environment: dict[str, str]) -> dict[str, str]:
+        return {"MVS_WORKER_PROFILE": SUBJECT12, "OGWP_COMFY_URL": "http://127.0.0.1:8188",
+                "OGWP_WORKER_VRAM_MB": "12282", "OGWP_WORKER_GPU_MODEL": "NVIDIA GeForce RTX 4070",
+                "OGWP_WORKER_RUNTIME_VERSIONS": json.dumps(versions), "OGWP_WORKER_CONCURRENCY": "1"}
+
+    monkeypatch.setattr(machine_profiles, "prepare_environment", prepare)
+    prepared, plugin = await agent_main.prepare_mixed_profile(
+        STATIC_ENVIRONMENT | {"OGWP_WORKER_PLUGINS": "comfy-workflow", "MVS_WORKER_PROFILE": SUBJECT12}
+    )
+    agent = agent_main.build_agent_from_env(prepared, profile_plugin=plugin)
+
+    assert isinstance(plugin, ProfileComfyPlugin)
+    assert agent._plugins[SUBJECT12_CAPABILITY] is plugin
+    assert SUBJECT12_CAPABILITY in agent.capability_ids
+    assert agent._runtime_versions == versions
+    assert agent._vram_mb == 12282
 
 
 async def test_a_failed_profile_check_starts_no_agent(monkeypatch: pytest.MonkeyPatch) -> None:

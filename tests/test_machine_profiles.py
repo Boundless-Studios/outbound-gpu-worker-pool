@@ -6,10 +6,11 @@ from dataclasses import replace
 import httpx
 import pytest
 from outbound_gpu_worker_pool import machine_profiles
-from outbound_gpu_worker_pool.comfy import TemplateRegistry
+from outbound_gpu_worker_pool.comfy import PACKAGED_TEMPLATES_DIRECTORY, TemplateRegistry
 from outbound_gpu_worker_pool.machine_profiles import (
-    LIGHTX8, STANDARD, RECIPE_KEY, CONFIG_KEY, LAST_FRAME_FEATURE_KEY, STANDARD_CAPABILITY,
-    describe_profile, inspect_runtime, profile_features, registry_for,
+    LIGHTX8, STANDARD, SUBJECT12, SUBJECT12_CAPABILITY, RECIPE_KEY, CONFIG_KEY,
+    LAST_FRAME_FEATURE_KEY, STANDARD_CAPABILITY,
+    describe_profile, inspect_runtime, profile_features, recipe_input_defaults, registry_for,
 )
 
 
@@ -170,3 +171,59 @@ async def test_a_profile_job_starts_a_stopped_runtime_before_inspecting_it(monke
     with pytest.raises(ValueError, match='stop here'):
         await plugin.execute(None, None)
     assert calls == ['ensure_running', 'inspect_runtime']
+
+
+def subject12_runtime(vram_mib=12288, argv=None):
+    stats = {'system': {'comfyui_version': '0.34.4', 'pytorch_version': '2.13.0+cu130',
+                        'argv': argv if argv is not None else ['--disable-pinned-memory']},
+             'devices': [{'type': 'cuda', 'name': 'RTX 4070', 'vram_total': vram_mib * 1024**2}]}
+    info = {}
+    for node in registry_for(SUBJECT12).template(SUBJECT12_CAPABILITY).graph.values():
+        fields = info.setdefault(node['class_type'], {'input': {'required': {}}})['input']['required']
+        for key, value in node['inputs'].items():
+            if key in {'unet_name', 'clip_name', 'vae_name', 'lora_name'}:
+                fields.setdefault(key, [[]])[0].append(value)
+    return stats, info
+
+
+def test_the_12gb_subject_profile_runs_the_v2_graph_under_its_own_capability():
+    standard = TemplateRegistry.from_directory(PACKAGED_TEMPLATES_DIRECTORY)
+    v2 = standard.template('image.flux2_klein.subject.v2')
+    subject = registry_for(SUBJECT12).template(SUBJECT12_CAPABILITY)
+    # Same graph, so the same bytes as the 16GB route; only routing and bounds differ.
+    assert subject.graph == v2.graph
+    assert [s.name for s in subject.image_slots] == ['ref_1', 'ref_2', 'ref_3']
+    steps = {e.name: e for e in subject.inputs}['steps']
+    assert steps.minimum == steps.maximum == steps.default == 20
+    description = describe_profile(SUBJECT12)
+    assert description['min_vram_mb'] == 12000 and description['steps'] == 20
+    assert description['bounds'] == {'width': 1024, 'height': 1024, 'references': 3}
+    assert 'physical 12GB card unmeasured' in description['evidence']
+    assert recipe_input_defaults(description['recipe_version'])['steps'] == 20
+
+
+def test_the_12gb_subject_graph_is_advertised_only_by_its_profile():
+    standard = TemplateRegistry.from_directory(PACKAGED_TEMPLATES_DIRECTORY)
+    assert standard.template(SUBJECT12_CAPABILITY) is None
+    assert [t.capability_id for t in registry_for(LIGHTX8).templates] == [
+        describe_profile(LIGHTX8)['capability_id']]
+    assert [t.capability_id for t in registry_for(SUBJECT12).templates] == [SUBJECT12_CAPABILITY]
+
+
+async def test_a_12gb_card_passes_the_subject_profile_check():
+    stats, info = subject12_runtime()
+    versions = await inspect_profile(SUBJECT12, stats, info)
+    assert versions[RECIPE_KEY] == describe_profile(SUBJECT12)['recipe_version']
+    assert versions['magic_profile'] == SUBJECT12
+    assert LAST_FRAME_FEATURE_KEY not in versions
+
+
+@pytest.mark.parametrize('failure', ['vram', 'gpu-only', 'highvram', 'model'])
+async def test_the_12gb_subject_profile_refuses_what_was_not_measured(failure):
+    stats, info = subject12_runtime(vram_mib=11264 if failure == 'vram' else 12288,
+                                    argv=['--gpu-only'] if failure == 'gpu-only'
+                                    else ['--highvram'] if failure == 'highvram' else None)
+    if failure == 'model':
+        info['CLIPLoader']['input']['required']['clip_name'][0].clear()
+    with pytest.raises(ValueError):
+        await inspect_profile(SUBJECT12, stats, info)
