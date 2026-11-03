@@ -478,7 +478,9 @@ python -m outbound_gpu_worker_pool.agent_main
   registry has the profile's capability removed, and the agent refuses to start if any other
   plugin still claims it.
 
-Only the standard profile can be mixed; the bounded 16GB recipe is refused. Without the
+`MVS_WORKER_PROFILE=flux2-klein-subject-12gb` mixes the same way: its capability
+`image.flux2_klein.subject.12gb.v1` runs only through the profile plugin. Only these two
+profiles can be mixed; the bounded 16GB recipe is refused. Without the
 variable the entrypoint behaves exactly as before. `build_agent_from_env` never reads the
 variable, so callers that wire their own profile plugin are unaffected.
 
@@ -541,6 +543,12 @@ versions and VRAM for host-side discovery.
 
 `machine_profiles` provides an opt-in `h3-16gb-lightx8` recipe (8 steps,
 512×512/four requested seconds, W4A8 + LightX2V 768p, Kitchen over Sage), and
-`h3-24gb-standard` retains the standard graph. Standard template loading does
-not advertise the 16GB graph. An explicit profile checks models, nodes and runtime
+`h3-24gb-standard` retains the standard graph. `flux2-klein-subject-12gb` serves
+subject images on a 12GB card: the unchanged Klein v2 graph under its own capability
+`image.flux2_klein.subject.12gb.v1`, fixed at 1024×1024, exactly 20 steps and at most three
+references, with a 12,000 MB minimum. It refuses `--gpu-only` and `--highvram`. Its evidence
+is an RTX 4090 with VRAM held so 11,914 MiB (and 10,900 MiB) stayed free. On that card,
+0, 1 and 3 references gave output byte-identical to v2, peaking at 10,218 MiB. Two
+references and a physical 12GB card have not been measured. Standard template loading
+advertises neither the 16GB graph nor the 12GB subject graph. An explicit profile checks models, nodes and runtime
 before advertising; its executor rechecks the runtime before each render.

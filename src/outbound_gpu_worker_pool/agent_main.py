@@ -6,11 +6,11 @@ of plugins the machine is approved to run; it never needs bucket or database
 access. SIGTERM and SIGINT drain: the in-flight job finishes, a final draining
 heartbeat is sent, and the process exits 0.
 
-Setting `MVS_WORKER_PROFILE=h3-24gb-standard` opts this entrypoint into a mixed
-mode. Startup verifies the standard recipe against the running ComfyUI, the
-standard H3 capability runs only through the profile plugin (which re-checks the
-runtime and attests what it executed for each job), and every other approved
-template keeps the generic `comfy-workflow` plugin. Without the variable nothing
+Setting `MVS_WORKER_PROFILE=h3-24gb-standard` (or `flux2-klein-subject-12gb`)
+opts this entrypoint into a mixed mode. Startup verifies that recipe against the
+running ComfyUI, the profile's capability runs only through the profile plugin
+(which re-checks the runtime and attests what it executed for each job), and
+every other approved template keeps the generic `comfy-workflow` plugin. Without the variable nothing
 changes. `build_agent_from_env` itself never reads it, so callers that wire
 their own profile plugin keep full control.
 """
@@ -179,21 +179,22 @@ async def prepare_mixed_profile(
 
     The returned environment carries the recipe, configuration and feature
     versions the profile check found, so the worker registers exactly what the
-    plugin will re-verify before each job. Only the standard profile can share a
-    machine with other templates; the bounded 16GB recipe is refused here rather
-    than silently run with a different plugin set.
+    plugin will re-verify before each job. The standard and 12GB subject profiles
+    can share a machine with other templates; the bounded 16GB recipe is refused
+    here rather than silently run with a different plugin set.
     """
     profile = environment.get(PROFILE_VARIABLE)
     if not profile:
         return dict(environment), None
     from outbound_gpu_worker_pool.machine_profiles import (
         STANDARD,
+        SUBJECT12,
         ProfileComfyPlugin,
         prepare_environment,
     )
 
-    if profile != STANDARD:
-        raise ValueError(f"mixed mode supports only {STANDARD}, not {profile}")
+    if profile not in (STANDARD, SUBJECT12):
+        raise ValueError(f"mixed mode supports only {STANDARD} or {SUBJECT12}, not {profile}")
     prepared = {**environment, **await prepare_environment(dict(environment))}
     versions = json.loads(prepared["OGWP_WORKER_RUNTIME_VERSIONS"])
     plugin = ProfileComfyPlugin(
