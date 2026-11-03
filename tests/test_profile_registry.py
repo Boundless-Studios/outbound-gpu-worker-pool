@@ -120,7 +120,7 @@ async def test_one_failing_profile_refuses_the_whole_runtime(comfy):
 
 
 async def test_agent_binds_each_profile_to_its_own_plugin(comfy):
-    from tests.test_agent_main import STATIC_ENVIRONMENT
+    from test_agent_main import STATIC_ENVIRONMENT
 
     prepared, plugins = await agent_main.prepare_mixed_profiles(
         STATIC_ENVIRONMENT | {'OGWP_WORKER_PLUGINS': 'comfy-workflow', 'MVS_WORKER_PROFILE': f'{STANDARD},{SUBJECT12}'})
@@ -148,7 +148,7 @@ def test_namespaced_versions_carry_only_per_profile_facts():
 @pytest.mark.parametrize('change, accepted', [(None, True), ('steps', False), ('runtime', False)])
 async def test_coordinator_attests_a_namespaced_recipe(change, accepted):
     from outbound_gpu_worker_pool.service import CompletionRejected, JobStatus
-    from tests.test_service import OUTPUT_BYTES, WORKER_A, _harness, _leased, _manifest
+    from test_service import OUTPUT_BYTES, WORKER_A, _harness, _leased, _manifest
 
     recipe = RECIPES_BEFORE_REGISTRY[SUBJECT12]
     pinned = {recipe_key(SUBJECT12): recipe, recipe_key(SUBJECT12, CONFIG_KEY): 'c' * 64}
