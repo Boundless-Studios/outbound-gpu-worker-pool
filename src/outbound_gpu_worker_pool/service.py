@@ -137,6 +137,26 @@ def _without_claim_token(record: JobRecord) -> JobRecord:
     return replace(record, claim_token=None)
 
 
+# The six inputs every recipe so far attests; used when the profile module is
+# not installed or the recipe is unknown, so a coordinator never compares less.
+_DEFAULT_ATTESTED_INPUTS = ('steps', 'width', 'height', 'length', 'fps', 'seed')
+
+
+def _pinned_recipe(runtime_versions: dict[str, str]) -> str | None:
+    """The recipe a job pins: `magic_recipe`, or a further profile's `magic_recipe@<profile>`."""
+    if 'magic_recipe' in runtime_versions:
+        return runtime_versions['magic_recipe']
+    return next((v for k, v in sorted(runtime_versions.items()) if k.startswith('magic_recipe@')), None)
+
+
+def _recipe_attested_inputs(recipe_version: str) -> tuple[str, ...]:
+    try:
+        from outbound_gpu_worker_pool.machine_profiles import recipe_attested_inputs
+    except ImportError:
+        return _DEFAULT_ATTESTED_INPUTS
+    return recipe_attested_inputs(recipe_version)
+
+
 def _recipe_defaults(recipe_version: str) -> dict[str, JobPayloadValue]:
     """Template defaults for an omitted input of a recipe-bound job.
 
@@ -660,14 +680,15 @@ class WorkerPoolService:
         return record
 
     async def _verify_output(self, record: JobRecord, manifest: OutputManifest) -> None:
-        if 'magic_recipe' in record.requirements.runtime_versions:
+        recipe = _pinned_recipe(record.requirements.runtime_versions)
+        if recipe is not None:
             reported = manifest.diagnostics.get('runtime_versions')
             if not isinstance(reported, dict) or any(reported.get(k) != v for k, v in record.requirements.runtime_versions.items()):
                 raise CompletionRejected('recipe_configuration_mismatch')
             effective = manifest.diagnostics.get('effective_inputs')
-            defaults = _recipe_defaults(record.requirements.runtime_versions['magic_recipe'])
+            defaults = _recipe_defaults(recipe)
             expected = {k: record.payload[k] if k in record.payload else defaults.get(k)
-                        for k in ('steps', 'width', 'height', 'length', 'fps', 'seed')}
+                        for k in _recipe_attested_inputs(recipe)}
             if not isinstance(effective, dict) or any(effective.get(k) != v for k, v in expected.items()):
                 raise CompletionRejected('effective_inputs_mismatch')
         if manifest.output_key != record.output_key:

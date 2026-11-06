@@ -21,7 +21,7 @@ import os
 import shlex
 import signal
 import tempfile
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from functools import partial
 from pathlib import Path
 
@@ -108,7 +108,7 @@ KNOWN_PLUGINS: dict[str, Callable[[Mapping[str, str]], GpuExecutorPlugin]] = {
 
 def build_agent_from_env(
     environment: Mapping[str, str],
-    profile_plugin: GpuExecutorPlugin | None = None,
+    profile_plugin: GpuExecutorPlugin | Sequence[GpuExecutorPlugin] | None = None,
 ) -> WorkerAgent:
     coordinator_url = _required(environment, "OGWP_WORKER_COORDINATOR_URL")
     worker_id = _required(environment, "OGWP_WORKER_ID")
@@ -123,22 +123,29 @@ def build_agent_from_env(
     else:
         raise ValueError(f"unsupported OGWP_WORKER_AUTH: {auth}")
     names = environment.get("OGWP_WORKER_PLUGINS", DETERMINISTIC_ECHO_PLUGIN_ID).split(",")
-    if profile_plugin is None:
+    profile_plugins: tuple[GpuExecutorPlugin, ...] = (
+        () if profile_plugin is None
+        else tuple(profile_plugin) if isinstance(profile_plugin, Sequence)
+        else (profile_plugin,)
+    )
+    if not profile_plugins:
         plugins = tuple(_plugin(name, environment) for name in names)
     else:
-        # The profile's capabilities leave the generic plugin entirely: an agent
+        # The profiles' capabilities leave the generic plugin entirely: an agent
         # maps each capability to the last plugin that claims it, so an overlap
         # would silently decide which plugin runs a recipe-bound job.
-        claimed = frozenset(
-            capability.capability_id
-            for capability in profile_plugin.capabilities().capabilities
-        )
+        claimed: set[str] = set()
+        for plugin in profile_plugins:
+            own = {capability.capability_id for capability in plugin.capabilities().capabilities}
+            if own & claimed:
+                raise ValueError(f"profile capabilities claimed twice: {sorted(own & claimed)}")
+            claimed |= own
         plugins = tuple(
-            _comfy_workflow_plugin(environment, exclude=claimed)
+            _comfy_workflow_plugin(environment, exclude=frozenset(claimed))
             if name.strip() == COMFY_WORKFLOW_PLUGIN_ID else _plugin(name, environment)
             for name in names
-        ) + (profile_plugin,)
-        for plugin in plugins[:-1]:
+        ) + profile_plugins
+        for plugin in plugins[:-len(profile_plugins)]:
             overlap = claimed & {
                 capability.capability_id for capability in plugin.capabilities().capabilities
             }
@@ -175,44 +182,63 @@ def build_agent_from_env(
 async def prepare_mixed_profile(
     environment: Mapping[str, str],
 ) -> tuple[dict[str, str], GpuExecutorPlugin | None]:
-    """Verify an opted-in standard profile and build its plugin, or change nothing.
+    """Single-profile form of `prepare_mixed_profiles`, for existing callers."""
+    prepared, plugins = await prepare_mixed_profiles(environment)
+    if len(plugins) > 1:
+        raise ValueError("several profiles are configured; use prepare_mixed_profiles")
+    return prepared, (plugins[0] if plugins else None)
+
+
+async def prepare_mixed_profiles(
+    environment: Mapping[str, str],
+) -> tuple[dict[str, str], tuple[GpuExecutorPlugin, ...]]:
+    """Verify the opted-in profiles and build their plugins, or change nothing.
 
     The returned environment carries the recipe, configuration and feature
-    versions the profile check found, so the worker registers exactly what the
-    plugin will re-verify before each job. The standard and 12GB subject profiles
-    can share a machine with other templates; the bounded 16GB recipe is refused
+    versions the profile checks found, so the worker registers exactly what the
+    plugins will re-verify before each job. `MVS_WORKER_PROFILE` names one
+    profile or several, comma-separated: the first registers the plain recipe
+    keys, each further one `magic_recipe@<profile>` and `magic_config@<profile>`.
+    A profile that cannot share a machine (the bounded 16GB recipe) is refused
     here rather than silently run with a different plugin set.
     """
-    profile = environment.get(PROFILE_VARIABLE)
-    if not profile:
-        return dict(environment), None
+    if not environment.get(PROFILE_VARIABLE, "").strip():
+        return dict(environment), ()
     from outbound_gpu_worker_pool.machine_profiles import (
-        STANDARD,
-        SUBJECT12,
+        PROFILES,
         ProfileComfyPlugin,
+        parse_profiles,
         prepare_environment,
     )
 
-    if profile not in (STANDARD, SUBJECT12):
-        raise ValueError(f"mixed mode supports only {STANDARD} or {SUBJECT12}, not {profile}")
+    profiles = parse_profiles(environment[PROFILE_VARIABLE])
+    refused = [p for p in profiles if not PROFILES[p].mixed_mode]
+    if refused:
+        allowed = " or ".join(p for p, spec in PROFILES.items() if spec.mixed_mode)
+        raise ValueError(f"mixed mode supports only {allowed}, not {', '.join(refused)}")
     prepared = {**environment, **await prepare_environment(dict(environment))}
-    versions = json.loads(prepared["OGWP_WORKER_RUNTIME_VERSIONS"])
-    plugin = ProfileComfyPlugin(
-        profile,
-        versions,
-        client=httpx.AsyncClient(timeout=COMFY_TIMEOUT_SECONDS),
-        base_url=prepared["OGWP_COMFY_URL"],
-        **_comfy_runtime(prepared),
+    merged = json.loads(prepared["OGWP_WORKER_RUNTIME_VERSIONS"])
+    per_profile = json.loads(prepared.get("MVS_WORKER_PROFILE_VERSIONS") or "{}") or {profiles[0]: merged}
+    plugins = tuple(
+        ProfileComfyPlugin(
+            profile,
+            per_profile[profile],
+            client=httpx.AsyncClient(timeout=COMFY_TIMEOUT_SECONDS),
+            base_url=prepared["OGWP_COMFY_URL"],
+            namespaced=index > 0,
+            **_comfy_runtime(prepared),
+        )
+        for index, profile in enumerate(profiles)
     )
-    return prepared, plugin
+    return prepared, plugins
 
 
 async def main(environment: Mapping[str, str] = os.environ) -> int:
-    prepared, profile_plugin = await prepare_mixed_profile(environment)
+    prepared, profile_plugins = await prepare_mixed_profiles(environment)
     agent = (
         build_agent_from_env(prepared)
-        if profile_plugin is None
-        else build_agent_from_env(prepared, profile_plugin=profile_plugin)
+        if not profile_plugins
+        else build_agent_from_env(prepared, profile_plugin=profile_plugins)
     )
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()

@@ -888,11 +888,16 @@ async def test_a_worker_executing_a_job_stays_present_as_busy(
         run_task = asyncio.create_task(harness.agent.run_once())
         try:
             await asyncio.wait_for(plugin.started.wait(), timeout=5.0)
-            for _ in range(20):
+            # The presence refresh runs on its own task; poll against a deadline
+            # rather than a fixed number of scheduler turns, which raced on CI.
+            deadline = asyncio.get_running_loop().time() + 5.0
+            while True:
                 record = await harness.registry.get("worker-a")
                 if record is not None and record.busy_job_id == submitted.job_id:
                     break
-                await asyncio.sleep(0)
+                if asyncio.get_running_loop().time() > deadline:
+                    break
+                await asyncio.sleep(0.01)
             assert record is not None
             assert record.busy_job_id == submitted.job_id
         finally:

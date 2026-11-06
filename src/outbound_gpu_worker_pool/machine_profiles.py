@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -37,27 +39,58 @@ SUBJECT12_REFUSED_FLAGS = ('--gpu-only', '--highvram')
 LAST_FRAME_FEATURE_KEY = 'magic_feature_last_frame'
 
 
+# The inputs a recipe-bound worker attests and the coordinator compares at
+# completion. Every profile so far attests the same six.
+H3_ATTESTED_INPUTS = ('steps', 'width', 'height', 'length', 'fps', 'seed')
+# A runtime may serve several profiles. The first keeps the plain recipe and
+# configuration keys, so jobs pinned before multi-profile workers still match;
+# each further profile registers them under `<key>@<profile>`.
+NAMESPACE_SEPARATOR = '@'
+
+
+@dataclass(frozen=True)
+class MachineProfile:
+    """One explicit recipe: what it runs, how it is checked and what it attests.
+
+    A new profile is one entry in PROFILES. Its description is fingerprinted
+    into the recipe version, so changing any described value makes every
+    registered worker of that profile ineligible for the jobs it serves.
+    """
+    name: str
+    capability_id: str
+    # 'standard' templates ship in the packaged directory; 'profile' ones are
+    # opt-in, under machine_profiles/.
+    template_directory: str
+    describe: Callable[[Any, list[str]], dict[str, Any]]
+    attested_inputs: tuple[str, ...] = H3_ATTESTED_INPUTS
+    # May share a runtime with other templates and profiles (mixed mode).
+    mixed_mode: bool = True
+    # Raises ValueError when the live ComfyUI launch flags break the recipe.
+    check_launch: Callable[[list[str], dict[str, Any]], None] | None = None
+    # Optional features (outside the fingerprint) from live object_info.
+    features: Callable[[dict[str, Any]], dict[str, str]] | None = None
+
+
 def registry_for(profile: str) -> TemplateRegistry:
-    if profile in (LIGHTX8, SUBJECT12):
-        bounded = TemplateRegistry.from_directory(PROFILE_DIRECTORY)
-        return TemplateRegistry([bounded.template(PROFILE_CAPABILITIES[profile])])
-    if profile == STANDARD:
-        standard = TemplateRegistry.from_directory(PACKAGED_TEMPLATES_DIRECTORY)
-        return TemplateRegistry([standard.template(STANDARD_CAPABILITY)])
-    raise ValueError(f'Unknown machine profile: {profile}')
+    spec = _profile(profile)
+    directory = PROFILE_DIRECTORY if spec.template_directory == 'profile' else PACKAGED_TEMPLATES_DIRECTORY
+    return TemplateRegistry([TemplateRegistry.from_directory(directory).template(spec.capability_id)])
+
+
+def _profile(profile: str) -> MachineProfile:
+    try:
+        return PROFILES[profile]
+    except KeyError:
+        raise ValueError(f'Unknown machine profile: {profile}') from None
 
 
 def describe_profile(profile: str) -> dict[str, Any]:
-    registry = registry_for(profile)
-    capability = PROFILE_CAPABILITIES[profile]
-    template = registry.template(capability)
+    spec = _profile(profile)
+    template = registry_for(profile).template(spec.capability_id)
     graph = template.graph
     models = sorted({str(v) for node in graph.values() for k, v in node['inputs'].items()
                      if k in {'unet_name', 'clip_name', 'vae_name', 'lora_name'}})
-    if profile == SUBJECT12:
-        description = _subject12_description(template, models)
-    else:
-        description = _video_description(profile, capability, template, models)
+    description = spec.describe(template, models)
     fingerprint = hashlib.sha256(json.dumps({'description': description, 'graph': graph},
                                            sort_keys=True, separators=(',', ':')).encode()).hexdigest()
     return {**description, 'recipe_version': fingerprint}
@@ -104,17 +137,20 @@ def _video_description(profile: str, capability: str, template, models: list[str
 
 
 def profile_features(profile: str, object_info: dict[str, Any]) -> dict[str, str]:
-    """Optional features this worker can actually run, as runtime versions.
+    """Optional features this worker can actually run, as runtime versions."""
+    spec = _profile(profile)
+    return spec.features(object_info) if spec.features else {}
 
-    Only the standard route declares last-frame conditioning, and only while both
-    its template wires a `last_frame` image slot into the H3 node's `last_frame`
-    input and the live ComfyUI node (`object_info`) accepts that input. An older
-    node that lacks it would lease a closed-loop job and fail inside ComfyUI.
-    The bounded 16GB route declares nothing here.
+
+def _standard_features(object_info: dict[str, Any]) -> dict[str, str]:
+    """Last-frame conditioning, declared only while it can actually run.
+
+    Only the standard route declares it, and only while both its template wires
+    a `last_frame` image slot into the H3 node's `last_frame` input and the live
+    ComfyUI node (`object_info`) accepts that input. An older node that lacks it
+    would lease a closed-loop job and fail inside ComfyUI.
     """
-    if profile != STANDARD:
-        return {}
-    template = registry_for(profile).template(STANDARD_CAPABILITY)
+    template = registry_for(STANDARD).template(STANDARD_CAPABILITY)
     slot = next((s for s in template.image_slots if s.name == 'last_frame'), None)
     wired = slot is not None and any(
         node['class_type'] == 'MiniMaxH3ImageToVideo'
@@ -123,6 +159,22 @@ def profile_features(profile: str, object_info: dict[str, Any]) -> dict[str, str
     live = object_info.get('MiniMaxH3ImageToVideo', {}).get('input', {})
     accepts = 'last_frame' in {**live.get('required', {}), **live.get('optional', {})}
     return {LAST_FRAME_FEATURE_KEY: '1'} if wired and accepts else {}
+
+
+def _check_subject12_launch(argv: list[str], system: dict[str, Any]) -> None:
+    if any(flag in argv for flag in SUBJECT12_REFUSED_FLAGS):
+        raise ValueError('12GB subject recipe refuses --gpu-only and --highvram; '
+                         'it was measured with models offloaded between stages')
+
+
+def _check_lightx8_launch(argv: list[str], system: dict[str, Any]) -> None:
+    required = ['--use-sage-attention', '--enable-dynamic-vram', '--fast-disk', '--disable-pinned-memory']
+    if any(flag not in argv for flag in required) or '--reserve-vram' not in argv:
+        raise ValueError('16GB recipe requires Sage, dynamic VRAM, fast disk, disabled pinned memory and reserve-vram 0')
+    if argv[argv.index('--reserve-vram')+1] not in ('0', '0.0'):
+        raise ValueError('16GB recipe requires reserve-vram 0')
+    if '+cu13' not in system.get('pytorch_version', ''):
+        raise ValueError('16GB recipe requires a CUDA 13 PyTorch build')
 
 
 async def inspect_runtime(profile: str, client: Any, base_url: str) -> dict[str, str]:
@@ -153,17 +205,9 @@ async def inspect_runtime(profile: str, client: Any, base_url: str) -> dict[str,
         raise ValueError('No CUDA GPU with enough VRAM for the configured profile')
     system = stats['system']
     argv = system.get('argv', [])
-    if profile == SUBJECT12 and any(flag in argv for flag in SUBJECT12_REFUSED_FLAGS):
-        raise ValueError('12GB subject recipe refuses --gpu-only and --highvram; '
-                         'it was measured with models offloaded between stages')
-    if profile == LIGHTX8:
-        required = ['--use-sage-attention', '--enable-dynamic-vram', '--fast-disk', '--disable-pinned-memory']
-        if any(flag not in argv for flag in required) or '--reserve-vram' not in argv:
-            raise ValueError('16GB recipe requires Sage, dynamic VRAM, fast disk, disabled pinned memory and reserve-vram 0')
-        if argv[argv.index('--reserve-vram')+1] not in ('0', '0.0'):
-            raise ValueError('16GB recipe requires reserve-vram 0')
-        if '+cu13' not in system.get('pytorch_version', ''):
-            raise ValueError('16GB recipe requires a CUDA 13 PyTorch build')
+    check_launch = _profile(profile).check_launch
+    if check_launch:
+        check_launch(argv, system)
     versions = {RECIPE_KEY: description['recipe_version'],
                 'comfyui': str(system.get('comfyui_version', 'unknown')),
                 'pytorch': str(system.get('pytorch_version', 'unknown')),
@@ -193,21 +237,86 @@ def recipe_input_defaults(recipe_version: str) -> dict[str, Any]:
 
 @lru_cache(maxsize=8)
 def _recipe_input_defaults(recipe_version: str) -> tuple[tuple[str, Any], ...]:
-    for profile in (STANDARD, LIGHTX8, SUBJECT12):
+    profile = _profile_for_recipe(recipe_version)
+    if profile is None:
+        return ()
+    template = registry_for(profile).template(PROFILES[profile].capability_id)
+    return tuple((entry.name, entry.default) for entry in template.inputs if entry.default is not None)
+
+
+@lru_cache(maxsize=8)
+def _profile_for_recipe(recipe_version: str) -> str | None:
+    for profile in PROFILES:
         if describe_profile(profile)['recipe_version'] == recipe_version:
-            template = registry_for(profile).template(PROFILE_CAPABILITIES[profile])
-            return tuple((entry.name, entry.default) for entry in template.inputs if entry.default is not None)
-    return ()
+            return profile
+    return None
+
+
+def recipe_attested_inputs(recipe_version: str) -> tuple[str, ...]:
+    """The effective inputs the coordinator compares for a recipe-bound job.
+
+    Unknown recipes keep the original six, so a coordinator never compares
+    less than it did before profiles declared their own.
+    """
+    profile = _profile_for_recipe(recipe_version)
+    return PROFILES[profile].attested_inputs if profile else H3_ATTESTED_INPUTS
+
+
+def recipe_key(profile: str | None = None, key: str = RECIPE_KEY) -> str:
+    """The runtime-versions key a profile's recipe (or configuration) is under.
+
+    None means the runtime's first profile, which keeps the plain key.
+    """
+    return key if profile is None else f'{key}{NAMESPACE_SEPARATOR}{profile}'
+
+
+def pinned_recipe(runtime_versions: dict[str, str]) -> str | None:
+    """The recipe a job's requirements pin, under the plain or a namespaced key."""
+    if RECIPE_KEY in runtime_versions:
+        return runtime_versions[RECIPE_KEY]
+    prefix = RECIPE_KEY + NAMESPACE_SEPARATOR
+    return next((v for k, v in sorted(runtime_versions.items()) if k.startswith(prefix)), None)
+
+
+def namespaced_versions(profile: str, versions: dict[str, str]) -> dict[str, str]:
+    """A further profile's own keys, for registration beside the first profile's.
+
+    Shared runtime facts (ComfyUI and PyTorch versions, launch flags) are the
+    same for every profile of one runtime and stay under the first profile's
+    plain keys; only the recipe, configuration and features are per profile.
+    """
+    own = {RECIPE_KEY: versions[RECIPE_KEY], CONFIG_KEY: versions[CONFIG_KEY],
+           'magic_profile': versions['magic_profile'],
+           **{k: v for k, v in versions.items() if k.startswith('magic_feature_')}}
+    return {recipe_key(profile, key): value for key, value in own.items()}
+
+
+def attested_versions(profile: str, versions: dict[str, str]) -> dict[str, str]:
+    """What a further profile's plugin reports at completion.
+
+    The shared runtime facts (ComfyUI and PyTorch versions, launch flags) under
+    their plain keys, as the worker registered them, so a job that also pins one
+    of them still verifies; the profile's own recipe, configuration, profile and
+    features under its namespaced keys. The plain recipe keys belong to the
+    runtime's first profile and are never reported for another.
+    """
+    shared = {k: v for k, v in versions.items()
+              if k not in (RECIPE_KEY, CONFIG_KEY, 'magic_profile') and not k.startswith('magic_feature_')}
+    return {**shared, **namespaced_versions(profile, versions)}
 
 
 class ProfileComfyPlugin(ComfyWorkflowPlugin):
     """Recheck the runtime for each job; a restart/config change fails closed."""
-    def __init__(self, profile: str, versions: dict[str, str], *, client: Any, base_url: str, **runtime: Any):
+    def __init__(self, profile: str, versions: dict[str, str], *, client: Any, base_url: str,
+                 namespaced: bool = False, **runtime: Any):
         # `runtime` carries the start command and startup timeout, so a profile
         # job brings a stopped ComfyUI back exactly as a generic job would.
         super().__init__(registry_for(profile), client=client, base_url=base_url, **runtime)
         self.profile = profile
         self.versions = versions
+        # A further profile of a multi-profile runtime attests under its
+        # namespaced keys, which are what its jobs pin.
+        self.namespaced = namespaced
         self.profile_client = client
         self.profile_url = base_url
 
@@ -219,15 +328,34 @@ class ProfileComfyPlugin(ComfyWorkflowPlugin):
             raise ValueError('ComfyUI configuration changed; restart worker and resolve a new recipe')
         from dataclasses import replace
         output = await super().execute(context, request)
-        return replace(output, diagnostics={**output.diagnostics, 'runtime_versions': dict(actual),
+        attested = attested_versions(self.profile, actual) if self.namespaced else dict(actual)
+        return replace(output, diagnostics={**output.diagnostics, 'runtime_versions': attested,
                                            'effective_inputs': dict(request.inputs)})
+
+
+def parse_profiles(value: str) -> list[str]:
+    """`MVS_WORKER_PROFILE`: one profile, or several separated by commas.
+
+    Every name must be a known profile and appear once; the first keeps the
+    plain recipe keys.
+    """
+    profiles = [name.strip() for name in value.split(',') if name.strip()]
+    for profile in profiles:
+        _profile(profile)
+    if len(set(profiles)) != len(profiles):
+        raise ValueError(f'MVS_WORKER_PROFILE repeats a profile: {value}')
+    if len(profiles) > 1:
+        refused = [p for p in profiles if not PROFILES[p].mixed_mode]
+        if refused:
+            raise ValueError(f'{", ".join(refused)} cannot share a runtime with other profiles')
+    return profiles
 
 
 async def prepare_environment(environment: dict[str, str]) -> dict[str, str]:
     """Validate an explicit deployment profile and return enrollment-safe settings."""
     import httpx
-    profile = environment.get('MVS_WORKER_PROFILE')
-    if not profile:
+    profiles = parse_profiles(environment.get('MVS_WORKER_PROFILE', ''))
+    if not profiles:
         return {}
     base_url = environment.get('OGWP_COMFY_URL', 'http://127.0.0.1:8188')
     async with httpx.AsyncClient(timeout=30) as client:
@@ -253,18 +381,41 @@ async def prepare_environment(environment: dict[str, str]) -> dict[str, str]:
                     if attempt == 119:
                         raise ValueError('ComfyUI did not become ready') from None
                     await asyncio.sleep(2)
-        versions = await inspect_runtime(profile, client, base_url)
+        per_profile = {profile: await inspect_runtime(profile, client, base_url) for profile in profiles}
+        versions = dict(per_profile[profiles[0]])
+        for profile in profiles[1:]:
+            versions.update(namespaced_versions(profile, per_profile[profile]))
         response = await client.get(base_url.rstrip('/') + '/system_stats')
         response.raise_for_status()
         device = max((d for d in response.json()['devices'] if d.get('type') == 'cuda'), key=lambda d:d['vram_total'])
-    settings = {'MVS_WORKER_PROFILE': profile, 'OGWP_COMFY_URL': base_url,
+    settings = {'MVS_WORKER_PROFILE': ','.join(profiles), 'OGWP_COMFY_URL': base_url,
             'OGWP_WORKER_VRAM_MB': str(device['vram_total']//(1024*1024)),
             'OGWP_WORKER_GPU_MODEL': device['name'],
             'OGWP_WORKER_RUNTIME_VERSIONS': json.dumps(versions, separators=(',', ':')),
             'OGWP_WORKER_CONCURRENCY': '1'}
+    if len(profiles) > 1:
+        # Each profile plugin re-verifies its own, un-namespaced versions.
+        settings['MVS_WORKER_PROFILE_VERSIONS'] = json.dumps(per_profile, separators=(',', ':'))
     if environment.get('OGWP_COMFY_START_COMMAND'):
         settings['OGWP_COMFY_START_COMMAND'] = environment['OGWP_COMFY_START_COMMAND']
     return settings
+
+
+PROFILES: dict[str, MachineProfile] = {
+    STANDARD: MachineProfile(
+        STANDARD, STANDARD_CAPABILITY, 'standard',
+        lambda template, models: _video_description(STANDARD, STANDARD_CAPABILITY, template, models),
+        features=_standard_features),
+    LIGHTX8: MachineProfile(
+        LIGHTX8, LIGHTX8_CAPABILITY, 'profile',
+        lambda template, models: _video_description(LIGHTX8, LIGHTX8_CAPABILITY, template, models),
+        mixed_mode=False, check_launch=_check_lightx8_launch),
+    SUBJECT12: MachineProfile(
+        SUBJECT12, SUBJECT12_CAPABILITY, 'profile', _subject12_description,
+        check_launch=_check_subject12_launch),
+}
+# Kept for callers that map a profile to its capability directly.
+assert PROFILE_CAPABILITIES == {name: spec.capability_id for name, spec in PROFILES.items()}
 
 
 def main() -> int:
