@@ -45,10 +45,13 @@ def test_the_engine_profile_describes_its_declared_recipe():
     assert stages[MESH3D_MESH_CAPABILITY]['deadline_seconds'] == 1800
     assert stages[MESH3D_CLEAN_CAPABILITY]['attested_inputs'] == ['quality_tier', 'target_triangles']
     assert stages[MESH3D_CLEAN_CAPABILITY]['deadline_seconds'] == 600
-    # Every provisional number carries its source.
+    # Every number carries its source, and the measured scope is recorded with it.
     assert {'min_vram_mb', 'cuda_architecture', 'blender', 'mesh_deadline_seconds',
-            'clean_deadline_seconds', 'engine_pins'} <= set(description['provenance'])
-    assert 'untested in Studio' in description['provenance']['min_vram_mb']
+            'clean_deadline_seconds', 'engine_pins', 'scope', 'determinism',
+            'mixed_mode'} <= set(description['provenance'])
+    assert 'measured' in description['provenance']['mesh_deadline_seconds']
+    assert 'front view only' in description['provenance']['scope']
+    assert 'not deterministic' in description['provenance']['determinism']
     recipe = description.pop('recipe_version')
     assert recipe == engine_recipe_version(description)
 
