@@ -87,6 +87,10 @@ class EngineDrift(RuntimeError):
     """The engine runtime is not the one this worker registered."""
 
 
+class InspectTimedOut(EngineDrift):
+    """`aismith-engine inspect` did not finish within its bound."""
+
+
 def engine_command(environment: dict[str, str] | Any) -> tuple[str, ...]:
     raw = environment.get(ENGINE_COMMAND_VARIABLE, '')
     return tuple(shlex.split(raw)) if raw.strip() else (AISMITH_ENGINE,)
@@ -192,7 +196,7 @@ async def run_inspect(command: tuple[str, ...], *, full: bool = False,
     try:
         stdout, _ = await asyncio.wait_for(process.communicate(), timeout)
     except TimeoutError:
-        raise EngineDrift(f'engine inspect did not finish in {timeout:.0f} s') from None
+        raise InspectTimedOut(f'engine inspect did not finish in {timeout:.0f} s') from None
     finally:
         await _kill_group(process, kill_grace_seconds)
     if process.returncode != 0:
@@ -357,9 +361,20 @@ class AISmithEnginePlugin:
         stage = self.recipe.stage_for(request.capability_id)
         if stage is None:
             raise PluginRequestRejected('unsupported capability')
-        actual = engine_versions(self.profile, await run_inspect(
-            self.command, timeout=self.inspect_timeout_seconds,
-            kill_grace_seconds=self.kill_grace_seconds))
+        # The pre-job inspection spends the job's own execution time: an expired
+        # context starts no process, and inspect never outlives the deadline.
+        remaining = (context.deadline - datetime.now(UTC)).total_seconds()
+        if remaining <= 0:
+            raise EngineTimedOut('the lease deadline passed before the engine was inspected')
+        inspect_timeout = min(remaining, self.inspect_timeout_seconds)
+        try:
+            report = await run_inspect(self.command, timeout=inspect_timeout,
+                                       kill_grace_seconds=self.kill_grace_seconds)
+        except InspectTimedOut:
+            if inspect_timeout < self.inspect_timeout_seconds:
+                raise EngineTimedOut('the lease deadline passed while the engine was inspected') from None
+            raise
+        actual = engine_versions(self.profile, report)
         if actual != self.versions:
             raise EngineDrift('the engine runtime changed; restart the worker and resolve a new recipe')
         workdir = context.workspace / 'engine'
@@ -435,6 +450,9 @@ class AISmithEnginePlugin:
             self._running.pop(context.job_id, None)
 
     def _result(self, workdir: Path, stage: EngineStage, code: int) -> dict[str, Any]:
+        # A crash or signal is never an engine status, whatever result.json says.
+        if code not in EXIT_STATUSES:
+            raise EngineFailed(f'the engine exited {code}, which is not an engine status code')
         try:
             result = json.loads((workdir / 'result.json').read_text(encoding='utf-8'))
         except (OSError, ValueError):
@@ -451,6 +469,8 @@ class AISmithEnginePlugin:
             raise PluginRequestRejected(error)
         if status == 'failed':
             raise EngineFailed(error)
+        if status != 'ok' or code != 0:
+            raise EngineFailed(f'the engine exited {code} with status {status!r}')
         engine = result.get('engine') if isinstance(result.get('engine'), dict) else {}
         if (engine.get('commit'), engine.get('sources_lock_sha256'), engine.get('weights_lock_sha256')) != (
                 self.versions['aismith_engine_commit'], self.versions['aismith_sources_lock'],

@@ -38,6 +38,7 @@ args = sys.argv[1:]
 with (here / 'calls.jsonl').open('a') as log:
     log.write(json.dumps(args) + '\n')
 if args[0] == 'inspect':
+    time.sleep(control.get('inspect_sleep', 0))
     print(json.dumps(control['inspect']))
     sys.exit(control.get('inspect_exit', 0))
 stage = args[1]
@@ -70,6 +71,8 @@ if status == 'ok':
     result['gate'] = {'name': 's2-canonicalize', 'passed': True} if stage == 'clean' else None
     result['measured'] = run.get('measured', {'triangles': 1234, 'watertight': True})
 result.update(run.get('result', {}))
+for key in run.get('drop', []):
+    result.pop(key, None)
 (workdir / 'result.json').write_text(json.dumps(result))
 print(json.dumps(result))
 sys.exit(run.get('exit', {'ok': 0, 'failed': 1, 'rejected': 2}[status]))
@@ -294,7 +297,11 @@ async def test_a_failed_stage_carries_the_engine_error(plugin, engine, tmp_path)
 
 
 @pytest.mark.parametrize('run, error', [
-    ({'crash': 139}, 'exited 139 without a readable result.json'),
+    ({'crash': 139}, 'exited 139, which is not an engine status code'),
+    # A crash exit with a complete-looking output and no status is never published.
+    ({'exit': 3, 'drop': ['status']}, 'exited 3, which is not an engine status code'),
+    ({'exit': 3, 'result': {'status': None}}, 'exited 3, which is not an engine status code'),
+    ({'exit': 137, 'drop': ['status']}, 'exited 137, which is not an engine status code'),
     ({'exit': 0, 'status': 'failed'}, "exited 0 with status 'failed'"),
     ({'result': {'stage': 'clean'}}, 'another stage'),
     ({'output': {'sha256': '0' * 64}}, 'size and sha256'),
@@ -370,7 +377,7 @@ def _gone(pid: int, within: float = 10.0) -> bool:
 
 
 async def _wait_for(path: Path):
-    for _ in range(200):
+    for _ in range(600):
         if path.exists() and path.read_text():
             return
         await asyncio.sleep(0.05)
@@ -380,9 +387,11 @@ async def _wait_for(path: Path):
 async def test_the_deadline_kills_the_whole_process_group(plugin, engine, tmp_path):
     engine.set(child=True, sleep=300)
     started = time.monotonic()
+    # The deadline also covers the pre-job inspection, so leave the stage
+    # enough of it to spawn its child even on a loaded machine.
     with pytest.raises(EngineTimedOut, match='deadline'):
-        await plugin.execute(context(tmp_path, deadline_seconds=2), plugin.validate(lease()))
-    assert time.monotonic() - started < 30
+        await plugin.execute(context(tmp_path, deadline_seconds=8), plugin.validate(lease()))
+    assert time.monotonic() - started < 40
     assert _gone(int((engine.directory / 'child.pid').read_text()))
 
 
@@ -471,3 +480,20 @@ async def test_the_coordinator_accepts_a_real_engine_completion(plugin, engine, 
     else:
         with pytest.raises(CompletionRejected):
             await complete
+
+
+async def test_an_expired_context_starts_no_process(plugin, engine, tmp_path):
+    with pytest.raises(EngineTimedOut, match='before the engine was inspected'):
+        await plugin.execute(context(tmp_path, deadline_seconds=-1), plugin.validate(lease()))
+    assert engine.calls() == []
+
+
+async def test_the_pre_job_inspection_is_bounded_by_the_deadline(plugin, engine, tmp_path):
+    engine.control['inspect_sleep'] = 60
+    engine.save()
+    assert plugin.inspect_timeout_seconds == 600
+    started = time.monotonic()
+    with pytest.raises(EngineTimedOut, match='while the engine was inspected'):
+        await plugin.execute(context(tmp_path, deadline_seconds=2), plugin.validate(lease()))
+    assert time.monotonic() - started < 20
+    assert [call[0] for call in engine.calls()] == ['inspect']
