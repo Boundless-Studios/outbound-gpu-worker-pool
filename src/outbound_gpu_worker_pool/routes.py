@@ -37,6 +37,7 @@ from outbound_gpu_worker_pool.contracts import (
     OutputManifest,
     PoolWorkerStatus,
     PoolWorkerView,
+    ProfileNotQualified,
     QueueDepth,
     WorkerAuthError,
     WorkerCapability,
@@ -108,6 +109,10 @@ def _mapped_errors() -> Iterator[None]:
         raise HTTPException(status_code=404, detail="pool job not found") from exc
     except StaleLease as exc:
         raise HTTPException(status_code=409, detail="job lease is stale") from exc
+    except ProfileNotQualified as exc:
+        raise HTTPException(
+            status_code=422, detail={"reason": "profile_not_qualified"}
+        ) from exc
 
 
 class WorkerCapabilityDto(BaseModel):

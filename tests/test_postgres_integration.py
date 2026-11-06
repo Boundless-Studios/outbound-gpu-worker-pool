@@ -1023,3 +1023,81 @@ async def test_last_frame_feature_gates_only_jobs_that_require_it_in_postgres(po
     ordinary = await _submit(pool_fixture, 'ordinary', requirements=JobRequirements(
         runtime_versions={RECIPE_KEY: recipe}))
     assert (await lease('registered-before', registered_before)).job_id == ordinary
+
+
+def _engine_service(fixture: PoolFixture):
+    from outbound_gpu_worker_pool import (
+        MemoryAssetStore, MemoryWorkerAuthenticator, WorkerEnrollment, WorkerIdentity,
+    )
+    from outbound_gpu_worker_pool.plugins import DeterministicEchoPlugin, capability_schemas_from_plugins
+    from outbound_gpu_worker_pool.service import WorkerPoolService
+
+    identity = WorkerIdentity("worker-3d", "static:worker-3d", "static")
+    assets = MemoryAssetStore()
+    service = WorkerPoolService(
+        fixture.jobs, assets, fixture.registry, fixture.audit,
+        MemoryWorkerAuthenticator({"test-credential": identity}),
+        capability_schemas_from_plugins((DeterministicEchoPlugin(),)),
+        enrollments={identity.worker_id: WorkerEnrollment(identity.subject, None)},
+    )
+    return service, assets, identity
+
+
+async def _seed_around_the_refusals(fixture: PoolFixture, assets, identity, versions: dict[str, str]):
+    """A mesh job and an echo job, and a worker serving both, written straight to Postgres."""
+    from outbound_gpu_worker_pool.engine_recipes import MESH3D_MESH_CAPABILITY
+
+    mesh = await _submit(fixture, "mesh3d", capability_id=MESH3D_MESH_CAPABILITY)
+    echo = await _submit(fixture, "echo")
+    await assets.write_once("inputs/pool/echo.bin", b"echo", "application/octet-stream")
+    await fixture.registry.upsert(
+        WorkerRegistration(
+            worker_id=identity.worker_id,
+            capabilities=tuple(
+                WorkerCapability(c, "aismith-engine", "1") for c in (MESH3D_MESH_CAPABILITY, ECHO)
+            ),
+            runtime_versions=versions,
+        ),
+        identity_subject=identity.subject,
+    )
+    return mesh, echo
+
+
+async def test_lease_never_hands_out_an_unqualified_job_from_postgres(pool_fixture: PoolFixture) -> None:
+    from outbound_gpu_worker_pool.engine_recipes import MESH3D_MESH_CAPABILITY
+
+    service, assets, identity = _engine_service(pool_fixture)
+    mesh, echo = await _seed_around_the_refusals(pool_fixture, assets, identity, {})
+    grant = await service.lease(identity, (MESH3D_MESH_CAPABILITY, ECHO))
+    assert grant is not None and grant.job_id == echo
+    assert await service.lease(identity, (MESH3D_MESH_CAPABILITY,)) is None
+    stored = await pool_fixture.jobs.get(mesh)
+    assert stored.status is JobStatus.QUEUED and stored.attempts == 0
+
+
+async def test_a_worker_naming_the_unqualified_profile_leases_nothing_from_postgres(
+    pool_fixture: PoolFixture,
+) -> None:
+    from outbound_gpu_worker_pool.engine_recipes import MESH3D
+    from outbound_gpu_worker_pool.machine_profiles import RECIPE_KEY, describe_profile
+
+    service, assets, identity = _engine_service(pool_fixture)
+    recipe = describe_profile(MESH3D)["recipe_version"]
+    _, echo = await _seed_around_the_refusals(pool_fixture, assets, identity, {RECIPE_KEY: recipe})
+    # A job pinning the unqualified recipe, which this worker's record would match in SQL.
+    pinned = await _submit(pool_fixture, "pinned-3d", requirements=JobRequirements(
+        runtime_versions={RECIPE_KEY: recipe}))
+    assert await service.lease(identity, (ECHO,)) is None
+    for job_id in (echo, pinned):
+        assert (await pool_fixture.jobs.get(job_id)).status is JobStatus.QUEUED
+
+
+async def test_submit_stores_no_unqualified_job_in_postgres(pool_fixture: PoolFixture) -> None:
+    from outbound_gpu_worker_pool import ProfileNotQualified
+    from outbound_gpu_worker_pool.engine_recipes import MESH3D_CLEAN_CAPABILITY
+
+    service, _, _ = _engine_service(pool_fixture)
+    with pytest.raises(ProfileNotQualified):
+        await service.submit(_submission("clean-3d", capability_id=MESH3D_CLEAN_CAPABILITY))
+    async with pool_fixture.pool.acquire() as connection:
+        assert await connection.fetchval(f"SELECT count(*) FROM {POOL_JOBS_TABLE}") == 0

@@ -40,6 +40,7 @@ from outbound_gpu_worker_pool.contracts import (
     OutputManifest,
     PoolWorkerStatus,
     PoolWorkerView,
+    ProfileNotQualified,
     QueueDepth,
     WorkerAuthenticator,
     WorkerAuthError,
@@ -149,12 +150,54 @@ def _pinned_recipe(runtime_versions: dict[str, str]) -> str | None:
     return next((v for k, v in sorted(runtime_versions.items()) if k.startswith('magic_recipe@')), None)
 
 
-def _recipe_attested_inputs(recipe_version: str) -> tuple[str, ...]:
+def _recipe_attested_inputs(recipe_version: str, capability_id: str) -> tuple[str, ...]:
     try:
         from outbound_gpu_worker_pool.machine_profiles import recipe_attested_inputs
     except ImportError:
         return _DEFAULT_ATTESTED_INPUTS
-    return recipe_attested_inputs(recipe_version)
+    return recipe_attested_inputs(recipe_version, capability_id)
+
+
+def _unqualified() -> dict[str, frozenset[str]]:
+    """The profiles, capabilities and recipes the pool must not register or run.
+
+    Without the profile module (no agent extras) the coordinator cannot tell a
+    qualified engine profile from an unqualified one, so it refuses them all.
+    """
+    try:
+        from outbound_gpu_worker_pool.machine_profiles import unqualified
+    except ImportError:
+        from outbound_gpu_worker_pool.engine_recipes import ENGINE_RECIPES
+
+        return {
+            "profiles": frozenset(ENGINE_RECIPES),
+            "capability_ids": frozenset(
+                c for recipe in ENGINE_RECIPES.values() for c in recipe.capability_ids
+            ),
+            "recipe_versions": frozenset(),
+        }
+    return unqualified()
+
+
+def _unqualified_reason(
+    capability_ids: tuple[str, ...] | list[str],
+    runtime_versions: Mapping[str, str],
+    refused: Mapping[str, frozenset[str]] | None = None,
+) -> str | None:
+    """Why a capability set or runtime-version map touches an unqualified profile."""
+    refused = _unqualified() if refused is None else refused
+    for capability_id in capability_ids:
+        if capability_id in refused["capability_ids"]:
+            return f"{capability_id} belongs to a machine profile that is not qualified yet"
+    for key, value in runtime_versions.items():
+        base, _, profile = key.partition("@")
+        if (
+            profile in refused["profiles"]
+            or (base == "magic_profile" and value in refused["profiles"])
+            or (base == "magic_recipe" and value in refused["recipe_versions"])
+        ):
+            return f"{key} names a machine profile that is not qualified yet"
+    return None
 
 
 def _recipe_defaults(recipe_version: str) -> dict[str, JobPayloadValue]:
@@ -216,7 +259,16 @@ class WorkerPoolService:
         self._active_auth = 0
 
     async def submit(self, submission: JobSubmission) -> JobRecord:
-        """Insert the job, or replay the record an equal submission created."""
+        """Insert the job, or replay the record an equal submission created.
+
+        A job for an unqualified profile's capability, or pinning its recipe or
+        name, raises `ProfileNotQualified` and is never stored.
+        """
+        reason = _unqualified_reason(
+            (submission.capability_id,), submission.requirements.runtime_versions
+        )
+        if reason is not None:
+            raise ProfileNotQualified(reason)
         result = await self._jobs.submit(submission)
         return _without_claim_token(result.record)
 
@@ -414,6 +466,15 @@ class WorkerPoolService:
         registration = replace(registration, tenant_id=enrollment.tenant_id)
         for capability in registration.capabilities:
             validate_capability_id(capability.capability_id)
+        # Refused outright rather than dropped: a worker advertising an
+        # unqualified profile is misconfigured, and the pool's own agent never
+        # does (enrolment refuses the profile first).
+        reason = _unqualified_reason(
+            [capability.capability_id for capability in registration.capabilities],
+            registration.runtime_versions,
+        )
+        if reason is not None:
+            raise ProfileNotQualified(reason)
         try:
             record = await self._registry.upsert(
                 registration, identity_subject=identity.subject
@@ -442,11 +503,18 @@ class WorkerPoolService:
             raise WorkerNotRegistered(identity.worker_id)
         if worker.status is WorkerStatus.DRAINING:
             return None
+        # A record whose runtime versions name an unqualified profile
+        # (registered before the refusal, or written around it) leases nothing,
+        # and no unqualified capability is ever leased, whatever the store holds.
+        refused = _unqualified()
+        if _unqualified_reason((), worker.runtime_versions, refused) is not None:
+            return None
         registered = set(worker.capability_ids)
         effective = tuple(
             capability_id
             for capability_id in capability_ids
             if capability_id in registered
+            and capability_id not in refused["capability_ids"]
         )
         if not effective:
             return None
@@ -680,6 +748,10 @@ class WorkerPoolService:
         return record
 
     async def _verify_output(self, record: JobRecord, manifest: OutputManifest) -> None:
+        if _unqualified_reason(
+            (record.capability_id,), record.requirements.runtime_versions
+        ) is not None:
+            raise CompletionRejected("profile_not_qualified")
         recipe = _pinned_recipe(record.requirements.runtime_versions)
         if recipe is not None:
             reported = manifest.diagnostics.get('runtime_versions')
@@ -688,7 +760,7 @@ class WorkerPoolService:
             effective = manifest.diagnostics.get('effective_inputs')
             defaults = _recipe_defaults(recipe)
             expected = {k: record.payload[k] if k in record.payload else defaults.get(k)
-                        for k in _recipe_attested_inputs(recipe)}
+                        for k in _recipe_attested_inputs(recipe, record.capability_id)}
             if not isinstance(effective, dict) or any(effective.get(k) != v for k, v in expected.items()):
                 raise CompletionRejected('effective_inputs_mismatch')
         if manifest.output_key != record.output_key:

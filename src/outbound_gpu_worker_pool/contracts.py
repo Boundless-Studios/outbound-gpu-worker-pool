@@ -488,6 +488,18 @@ class IdempotencyConflict(ValueError):
     """An idempotency key was reused for a different canonical request."""
 
 
+class ProfileNotQualified(ValueError):
+    """A machine profile is declared but not qualified to enrol, register or run.
+
+    Raised at enrolment, at worker registration and at dispatch, so a
+    provisional recipe stays inert until its qualification lands.
+    """
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
 class AssetNotFound(FileNotFoundError):
     """The requested immutable asset is absent from storage."""
 
