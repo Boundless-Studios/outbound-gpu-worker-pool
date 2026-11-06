@@ -9,7 +9,8 @@ import pytest
 from outbound_gpu_worker_pool import JobRequirements, agent_main, machine_profiles
 from outbound_gpu_worker_pool.machine_profiles import (
     CONFIG_KEY, H3_ATTESTED_INPUTS, LIGHTX8, PROFILES, RECIPE_KEY, STANDARD, STANDARD_CAPABILITY,
-    SUBJECT12, SUBJECT12_CAPABILITY, ProfileComfyPlugin, describe_profile, namespaced_versions,
+    SUBJECT12, SUBJECT12_CAPABILITY, ProfileComfyPlugin, attested_versions, describe_profile,
+    namespaced_versions,
     parse_profiles, pinned_recipe, prepare_environment, recipe_attested_inputs, recipe_input_defaults,
     recipe_key, registry_for,
 )
@@ -172,3 +173,42 @@ async def test_coordinator_attests_a_namespaced_recipe(change, accepted):
     else:
         with pytest.raises(CompletionRejected):
             await complete
+
+
+async def test_multi_profile_versions_fit_the_heartbeat(comfy):
+    """The coordinator's heartbeat schema accepts what a two-profile worker registers."""
+    from outbound_gpu_worker_pool.routes import WorkerHeartbeatRequest
+
+    settings = await prepare_environment({'MVS_WORKER_PROFILE': f'{STANDARD},{SUBJECT12}'})
+    versions = json.loads(settings['OGWP_WORKER_RUNTIME_VERSIONS'])
+    request = WorkerHeartbeatRequest.model_validate({
+        'worker_id': 'ilya-desktop',
+        'capabilities': [{'capability_id': SUBJECT12_CAPABILITY, 'plugin_id': 'magic-comfy-profile',
+                          'plugin_version': '1'}],
+        'runtime_versions': versions,
+    })
+    assert request.runtime_versions[recipe_key(SUBJECT12)] == RECIPES_BEFORE_REGISTRY[SUBJECT12]
+
+
+async def test_a_further_profile_attests_shared_runtime_facts(comfy):
+    """A job that pins `pytorch` beside the namespaced recipe still verifies."""
+    from outbound_gpu_worker_pool.service import CompletionRejected, JobStatus
+    from test_service import OUTPUT_BYTES, WORKER_A, _harness, _leased, _manifest
+
+    settings = await prepare_environment({'MVS_WORKER_PROFILE': f'{STANDARD},{SUBJECT12}'})
+    per_profile = json.loads(settings['MVS_WORKER_PROFILE_VERSIONS'])
+    reported = attested_versions(SUBJECT12, per_profile[SUBJECT12])
+    assert RECIPE_KEY not in reported and reported['pytorch'] == '2.14.0+cu130'
+    recipe = RECIPES_BEFORE_REGISTRY[SUBJECT12]
+    pinned = {recipe_key(SUBJECT12): recipe, recipe_key(SUBJECT12, CONFIG_KEY): reported[recipe_key(SUBJECT12, CONFIG_KEY)],
+              'pytorch': '2.14.0+cu130'}
+    harness = _harness()
+    grant = await _leased(harness)
+    record = harness.jobs.records[grant.job_id]
+    harness.jobs.records[grant.job_id] = replace(
+        record, payload={'prompt': 'an orc'}, requirements=JobRequirements(runtime_versions=pinned))
+    await harness.assets.write_once(grant.output_key, OUTPUT_BYTES, 'text/plain')
+    await harness.service.complete(WORKER_A, grant.job_id, grant.claim_token, _manifest(
+        grant, OUTPUT_BYTES, diagnostics={'runtime_versions': reported,
+                                          'effective_inputs': {**recipe_input_defaults(recipe), 'prompt': 'an orc'}}))
+    assert harness.jobs.records[grant.job_id].status == JobStatus.COMPLETED

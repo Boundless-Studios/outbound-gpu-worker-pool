@@ -291,6 +291,20 @@ def namespaced_versions(profile: str, versions: dict[str, str]) -> dict[str, str
     return {recipe_key(profile, key): value for key, value in own.items()}
 
 
+def attested_versions(profile: str, versions: dict[str, str]) -> dict[str, str]:
+    """What a further profile's plugin reports at completion.
+
+    The shared runtime facts (ComfyUI and PyTorch versions, launch flags) under
+    their plain keys, as the worker registered them, so a job that also pins one
+    of them still verifies; the profile's own recipe, configuration, profile and
+    features under its namespaced keys. The plain recipe keys belong to the
+    runtime's first profile and are never reported for another.
+    """
+    shared = {k: v for k, v in versions.items()
+              if k not in (RECIPE_KEY, CONFIG_KEY, 'magic_profile') and not k.startswith('magic_feature_')}
+    return {**shared, **namespaced_versions(profile, versions)}
+
+
 class ProfileComfyPlugin(ComfyWorkflowPlugin):
     """Recheck the runtime for each job; a restart/config change fails closed."""
     def __init__(self, profile: str, versions: dict[str, str], *, client: Any, base_url: str,
@@ -314,7 +328,7 @@ class ProfileComfyPlugin(ComfyWorkflowPlugin):
             raise ValueError('ComfyUI configuration changed; restart worker and resolve a new recipe')
         from dataclasses import replace
         output = await super().execute(context, request)
-        attested = namespaced_versions(self.profile, actual) if self.namespaced else dict(actual)
+        attested = attested_versions(self.profile, actual) if self.namespaced else dict(actual)
         return replace(output, diagnostics={**output.diagnostics, 'runtime_versions': attested,
                                            'effective_inputs': dict(request.inputs)})
 

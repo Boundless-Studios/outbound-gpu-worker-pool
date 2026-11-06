@@ -66,7 +66,10 @@ MAX_PLUGIN_ID_LENGTH = 64
 MAX_PLUGIN_VERSION_LENGTH = 32
 MAX_MODEL_ID_LENGTH = 128
 MAX_MODEL_VERSION_LENGTH = 64
-MAX_RUNTIME_VERSIONS = 16
+# Room for several machine profiles per runtime (machine_profiles: each further
+# profile adds namespaced recipe, configuration, profile and feature keys).
+MAX_RUNTIME_VERSIONS = 32
+MAX_RUNTIME_VERSION_KEY_LENGTH = 96
 MAX_LABELS = 16
 MAX_CAPABILITIES = 32
 WORKER_ID_PATTERN = r"^[a-z0-9][a-z0-9-]{0,127}$"
@@ -160,7 +163,7 @@ class WorkerHeartbeatRequest(BaseModel):
     gpu_model: str | None = Field(default=None, max_length=64)
     vram_mb: int | None = Field(default=None, ge=0, le=1_000_000)
     runtime_versions: dict[
-        Annotated[str, Field(min_length=1, max_length=32)],
+        Annotated[str, Field(min_length=1, max_length=MAX_RUNTIME_VERSION_KEY_LENGTH)],
         Annotated[str, Field(min_length=1, max_length=64)],
     ] = Field(default_factory=dict, max_length=MAX_RUNTIME_VERSIONS)
     cost_class: CostClass = CostClass.LOCAL
