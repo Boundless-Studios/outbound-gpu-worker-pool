@@ -121,8 +121,8 @@ def engine_recipe_version(description: dict[str, Any]) -> str:
 
 MESH3D_RECIPE = EngineRecipe(
     engine=AISMITH_ENGINE,
-    # Provisional: no AISmith-3D engine release is tagged yet. The engine-cli
-    # branch head is not a stable pin, so these stay unset until qualification.
+    # Set from the tagged AISmith-3D engine release; until then the profile
+    # stays unqualified and the pool refuses it.
     engine_tag=None,
     engine_commit=None,
     sources_lock_sha256=None,
@@ -137,7 +137,7 @@ MESH3D_RECIPE = EngineRecipe(
             settings=(('resolution', ('choices', MESH_RESOLUTIONS)), ('seed', ('range', (0, MAX_SEED)))),
             required_settings=('resolution', 'seed'), one_of_settings=(),
             attested_inputs=('resolution', 'seed'),
-            deadline_seconds=7_200,
+            deadline_seconds=1_800,
         ),
         EngineStage(
             capability_id=MESH3D_CLEAN_CAPABILITY, stage='clean',
@@ -146,24 +146,30 @@ MESH3D_RECIPE = EngineRecipe(
                       ('target_triangles', ('range', TARGET_TRIANGLES_RANGE))),
             required_settings=(), one_of_settings=('quality_tier', 'target_triangles'),
             attested_inputs=('quality_tier', 'target_triangles'),
-            deadline_seconds=1_800,
+            deadline_seconds=600,
         ),
     ),
     provenance=(
-        ('status', 'provisional and unqualified; no number below was measured in Studio'),
-        ('engine_pins', 'unset: AISmith-3D has no tagged engine release yet'),
-        ('min_vram_mb', 'AISmith-3D notes, untested in Studio: docs/gpu-usage.md (TRELLIS.2 FP8 '
-                        'stages CPU/GPU offload below 20 GB free; audited on an RTX 4090 24 GB) and '
-                        'HANDOFF-UNIRIG.md (Flux.2 Klein view synthesis ~16.5 GB)'),
-        ('cuda_architecture', 'AISmith-3D TRELLIS.2 native build contract (native-contract.json '
-                              'cuda_architecture 8.9, RTX 4090); untested in Studio'),
-        ('blender', 'AISmith-3D README: Blender 4.2 or later, reference install 4.2.23 LTS'),
-        ('mesh_deadline_seconds', 'AISmith-3D backend/app/native.py run_trellis_fp8 timeout=7200; '
-                                  'also the pool maximum'),
-        ('clean_deadline_seconds', 'AISmith-3D backend/app/native.py has no whole-stage canonicalize '
-                                   'timeout; its longest Blender steps (voxel remesh, bake) each cap '
-                                   'at timeout=1800. Up to 3 remesh attempts plus bake, floor, '
-                                   'projection and similarity could exceed it; unmeasured'),
+        ('status', 'measured on one RTX 4090 (ilya-desktop), 2026-11-05/06; qualified once the '
+                   'engine pins below are set'),
+        ('scope', 'front view only, mesh resolution 1024, clean standard tier without view '
+                  'projection, one RTX 4090 24 GB (WSL2, driver 610.88); multi-view, refine and '
+                  'the high/ultra tiers are unmeasured'),
+        ('determinism', 'mesh output is not deterministic: the same spec and seed gave a different '
+                        'mesh (sha256, face count, watertightness), so provenance never claims '
+                        'byte reproducibility'),
+        ('engine_pins', 'unset until the AISmith-3D engine release is tagged'),
+        ('min_vram_mb', 'kept at 24 GB by decision; measured engine peaks were about 6.9 GB '
+                        '(mesh) and 3 GB (clean). Smaller cards get their own profile after a '
+                        'run on such a card'),
+        ('cuda_architecture', 'TRELLIS.2 native build contract (native-contract.json '
+                              'cuda_architecture 8.9); matched on the qualifying RTX 4090'),
+        ('blender', 'Blender 4.2.23 LTS on the qualifying machine'),
+        ('mesh_deadline_seconds', '1800 by decision; measured wall time 1:44 to 3:27 over 4 runs '
+                                  '(engine 102 to 205 s)'),
+        ('clean_deadline_seconds', '600 by decision; measured wall time 0:46 to 0:49 over 3 runs '
+                                   '(engine 44 to 46 s)'),
+        ('mixed_mode', 'one profile at a time by decision: not shared with H3 on one GPU'),
         ('mesh_resolutions', 'AISmith-3D run_trellis_fp8 runs 768 at 1024, so only 512 and 1024 '
                              'are accepted'),
     ),

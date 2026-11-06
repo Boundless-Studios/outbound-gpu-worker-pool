@@ -42,9 +42,9 @@ def test_the_engine_profile_describes_its_declared_recipe():
     stages = {c['capability_id']: c for c in description['capabilities']}
     assert set(stages) == {MESH3D_MESH_CAPABILITY, MESH3D_CLEAN_CAPABILITY}
     assert stages[MESH3D_MESH_CAPABILITY]['attested_inputs'] == ['resolution', 'seed']
-    assert stages[MESH3D_MESH_CAPABILITY]['deadline_seconds'] == 7200
+    assert stages[MESH3D_MESH_CAPABILITY]['deadline_seconds'] == 1800
     assert stages[MESH3D_CLEAN_CAPABILITY]['attested_inputs'] == ['quality_tier', 'target_triangles']
-    assert stages[MESH3D_CLEAN_CAPABILITY]['deadline_seconds'] == 1800
+    assert stages[MESH3D_CLEAN_CAPABILITY]['deadline_seconds'] == 600
     # Every provisional number carries its source.
     assert {'min_vram_mb', 'cuda_architecture', 'blender', 'mesh_deadline_seconds',
             'clean_deadline_seconds', 'engine_pins'} <= set(description['provenance'])
