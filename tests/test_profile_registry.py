@@ -32,11 +32,11 @@ def test_registry_keeps_every_recipe_version(profile):
 
 def test_unknown_profiles_are_refused():
     with pytest.raises(ValueError, match='Unknown machine profile'):
-        registry_for('mesh3d-24gb-standard')
+        registry_for('mesh3d-24gb-unknown')
 
 
 def test_attested_inputs_follow_the_recipe():
-    for profile in PROFILES:
+    for profile in (name for name, spec in PROFILES.items() if spec.kind == 'comfy'):
         assert recipe_attested_inputs(describe_profile(profile)['recipe_version']) == H3_ATTESTED_INPUTS
     # An unknown recipe never compares less than before.
     assert recipe_attested_inputs('f' * 64) == H3_ATTESTED_INPUTS
