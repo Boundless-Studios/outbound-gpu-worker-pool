@@ -1025,6 +1025,10 @@ async def test_last_frame_feature_gates_only_jobs_that_require_it_in_postgres(po
     assert (await lease('registered-before', registered_before)).job_id == ordinary
 
 
+# The shipped engine profile is qualified; refusals use a test-only unqualified copy.
+from test_engine_profile import unqualified  # noqa: E402,F401  (fixture)
+
+
 def _engine_service(fixture: PoolFixture):
     from outbound_gpu_worker_pool import (
         MemoryAssetStore, MemoryWorkerAuthenticator, WorkerEnrollment, WorkerIdentity,
@@ -1063,7 +1067,9 @@ async def _seed_around_the_refusals(fixture: PoolFixture, assets, identity, vers
     return mesh, echo
 
 
-async def test_lease_never_hands_out_an_unqualified_job_from_postgres(pool_fixture: PoolFixture) -> None:
+async def test_lease_never_hands_out_an_unqualified_job_from_postgres(
+    pool_fixture: PoolFixture, unqualified: str
+) -> None:
     from outbound_gpu_worker_pool.engine_recipes import MESH3D_MESH_CAPABILITY
 
     service, assets, identity = _engine_service(pool_fixture)
@@ -1076,13 +1082,12 @@ async def test_lease_never_hands_out_an_unqualified_job_from_postgres(pool_fixtu
 
 
 async def test_a_worker_naming_the_unqualified_profile_leases_nothing_from_postgres(
-    pool_fixture: PoolFixture,
+    pool_fixture: PoolFixture, unqualified: str
 ) -> None:
-    from outbound_gpu_worker_pool.engine_recipes import MESH3D
-    from outbound_gpu_worker_pool.machine_profiles import RECIPE_KEY, describe_profile
+    from outbound_gpu_worker_pool.machine_profiles import RECIPE_KEY
 
     service, assets, identity = _engine_service(pool_fixture)
-    recipe = describe_profile(MESH3D)["recipe_version"]
+    recipe = unqualified
     _, echo = await _seed_around_the_refusals(pool_fixture, assets, identity, {RECIPE_KEY: recipe})
     # A job pinning the unqualified recipe, which this worker's record would match in SQL.
     pinned = await _submit(pool_fixture, "pinned-3d", requirements=JobRequirements(
@@ -1092,7 +1097,9 @@ async def test_a_worker_naming_the_unqualified_profile_leases_nothing_from_postg
         assert (await pool_fixture.jobs.get(job_id)).status is JobStatus.QUEUED
 
 
-async def test_submit_stores_no_unqualified_job_in_postgres(pool_fixture: PoolFixture) -> None:
+async def test_submit_stores_no_unqualified_job_in_postgres(
+    pool_fixture: PoolFixture, unqualified: str
+) -> None:
     from outbound_gpu_worker_pool import ProfileNotQualified
     from outbound_gpu_worker_pool.engine_recipes import MESH3D_CLEAN_CAPABILITY
 
@@ -1101,3 +1108,24 @@ async def test_submit_stores_no_unqualified_job_in_postgres(pool_fixture: PoolFi
         await service.submit(_submission("clean-3d", capability_id=MESH3D_CLEAN_CAPABILITY))
     async with pool_fixture.pool.acquire() as connection:
         assert await connection.fetchval(f"SELECT count(*) FROM {POOL_JOBS_TABLE}") == 0
+
+
+async def test_lease_hands_out_a_qualified_mesh_job_from_postgres(pool_fixture: PoolFixture) -> None:
+    from outbound_gpu_worker_pool.engine_recipes import MESH3D, MESH3D_MESH_CAPABILITY
+    from outbound_gpu_worker_pool.machine_profiles import CONFIG_KEY, RECIPE_KEY, describe_profile
+
+    service, assets, identity = _engine_service(pool_fixture)
+    versions = {RECIPE_KEY: describe_profile(MESH3D)["recipe_version"], CONFIG_KEY: "c" * 64,
+                "magic_profile": MESH3D}
+    submission = _submission("mesh-q", capability_id=MESH3D_MESH_CAPABILITY,
+                             input_keys=("inputs/pool/front.png",),
+                             payload={"inputs": {"front": "inputs/pool/front.png"}, "resolution": 1024, "seed": 7},
+                             requirements=JobRequirements(runtime_versions={
+                                 RECIPE_KEY: versions[RECIPE_KEY], CONFIG_KEY: versions[CONFIG_KEY]}))
+    await assets.write_once("inputs/pool/front.png", b"png", "image/png")
+    await service.submit(submission)
+    await service.register_heartbeat(identity, WorkerRegistration(
+        worker_id=identity.worker_id, capabilities=(WorkerCapability(MESH3D_MESH_CAPABILITY, "aismith-engine", "1"),),
+        runtime_versions=versions))
+    grant = await service.lease(identity, (MESH3D_MESH_CAPABILITY,))
+    assert grant is not None and grant.job_id == submission.job_id

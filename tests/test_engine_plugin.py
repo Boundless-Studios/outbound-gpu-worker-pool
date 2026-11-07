@@ -15,17 +15,16 @@ from outbound_gpu_worker_pool import (
     AssetGrant, JobRequirements, JobStatus, LeaseGrant, WorkerRegistration,
 )
 from outbound_gpu_worker_pool.engine import (
-    ENGINE_COMMAND_VARIABLE, AISmithEnginePlugin, EngineCancelled, EngineDrift, EngineFailed,
+    ENGINE_COMMAND_VARIABLE, AISmithEnginePlugin, _weight_problems, EngineCancelled, EngineDrift, EngineFailed,
     EngineTimedOut, engine_versions,
 )
 from outbound_gpu_worker_pool.engine_recipes import (
-    MESH3D, MESH3D_CLEAN_CAPABILITY, MESH3D_MESH_CAPABILITY,
+    MESH3D, MESH3D_CLEAN_CAPABILITY, MESH3D_MESH_CAPABILITY, MESH3D_RECIPE,
 )
 from outbound_gpu_worker_pool.machine_profiles import (
     CONFIG_KEY, PROFILES, RECIPE_KEY, describe_profile, prepare_environment, recipe_key,
 )
 from outbound_gpu_worker_pool.plugins import ExecutionContext, PluginRequestRejected
-from test_engine_profile import qualified_profile
 from test_service import WORKER_A, _harness, _manifest, _submission
 
 FAKE_ENGINE = r'''
@@ -79,10 +78,25 @@ sys.exit(run.get('exit', {'ok': 0, 'failed': 1, 'rejected': 2}[status]))
 '''
 
 
+COMMIT = MESH3D_RECIPE.engine_commit
+# The weight sets the mesh stage loads, two files each, plus the phase-2 rig
+# checkpoint, which the qualifying box does not have installed.
+RIG_CHECKPOINT = 'unirig-skeleton-ar256'
+
+
+def weight_files() -> list[dict]:
+    files = [{'weight_id': weight_id, 'dest': f'{weight_id}/part-{n}.safetensors', 'status': 'ok',
+              'observed_sha256': None}
+             for weight_id in MESH3D_RECIPE.weight_ids for n in (1, 2)]
+    return files + [{'weight_id': RIG_CHECKPOINT, 'dest': 'unirig/skeleton.ckpt', 'status': 'missing',
+                     'observed_sha256': None}]
+
+
 def inspect_report() -> dict:
     return {
-        'engine': {'name': 'local-3d-studio', 'version': '0.1.0', 'commit': 'a' * 40,
-                   'sources_lock_sha256': 'b' * 64, 'weights_lock_sha256': 'c' * 64},
+        'engine': {'name': 'local-3d-studio', 'version': '0.1.0', 'commit': COMMIT,
+                   'sources_lock_sha256': MESH3D_RECIPE.sources_lock_sha256,
+                   'weights_lock_sha256': MESH3D_RECIPE.weights_lock_sha256},
         'gpus': [{'name': 'NVIDIA GeForce RTX 4090', 'compute_capability': '8.9',
                   'memory_mb': 24564, 'driver': '581.57'}],
         'runtimes': {
@@ -91,7 +105,9 @@ def inspect_report() -> dict:
             'unirig': {'torch': None},
             'blender': {'path': '/opt/blender/blender', 'version': 'Blender 4.2.23 LTS'},
         },
-        'weights': {'ok': True, 'pinned': True, 'files': []},
+        # False because the rig checkpoint is missing, as on the qualifying box;
+        # the profile requires only the sets its stages load.
+        'weights': {'ok': False, 'pinned': False, 'files': weight_files()},
         'offline': True,
     }
 
@@ -120,12 +136,7 @@ class FakeEngine:
 
 
 @pytest.fixture
-def qualified(monkeypatch):
-    monkeypatch.setitem(PROFILES, MESH3D, qualified_profile())
-
-
-@pytest.fixture
-def engine(tmp_path, qualified):
+def engine(tmp_path):
     directory = tmp_path / 'engine'
     directory.mkdir()
     return FakeEngine(directory)
@@ -246,13 +257,13 @@ async def test_a_mesh_job_produces_one_attested_glb(plugin, engine, tmp_path):
     assert output.path.read_bytes().startswith(b'glTF')
     assert output.path.is_relative_to(ctx.workspace / 'engine')
     assert output.content_type == 'model/gltf-binary'
-    assert (output.model_id, output.model_version, output.seed) == ('aismith-engine/mesh', 'a' * 40, 7)
+    assert (output.model_id, output.model_version, output.seed) == ('aismith-engine/mesh', COMMIT, 7)
     diagnostics = output.diagnostics
     assert diagnostics['runtime_versions'] == plugin.versions
     assert diagnostics['effective_inputs'] == {'resolution': 1024, 'seed': 7}
     assert diagnostics['engine_effective_inputs']['views'] == ['front']
     assert diagnostics['measured'] == {'triangles': 1234, 'watertight': True}
-    assert diagnostics['engine']['commit'] == 'a' * 40
+    assert diagnostics['engine']['commit'] == COMMIT
     assert diagnostics['weights'] == {'ok': True, 'pinned': True}
     # The spec binds the downloaded file to its stage input name.
     assert engine.spec() == {'schema_version': 1, 'stage': 'mesh', 'settings': {'resolution': 1024, 'seed': 7},
@@ -326,7 +337,7 @@ def _drift(report, change):
     elif change == 'weights-lock':
         report['engine']['weights_lock_sha256'] = 'e' * 64
     elif change == 'unpinned':
-        report['weights']['pinned'] = False
+        report['weights']['files'][0]['status'] = 'unpinned'
     elif change == 'gpu':
         report['gpus'][0]['compute_capability'] = '8.6'
     elif change == 'vram':
@@ -441,7 +452,7 @@ async def test_enrolment_registers_what_each_job_rechecks(engine):
 async def test_enrolment_refuses_a_runtime_off_the_recipe(engine):
     engine.control['inspect'] = _drift(inspect_report(), 'unpinned')
     engine.save()
-    with pytest.raises(EngineDrift, match='pinned'):
+    with pytest.raises(EngineDrift, match='trellis2-4b-fp8 is not verified'):
         await prepare_environment({'MVS_WORKER_PROFILE': MESH3D,
                                    ENGINE_COMMAND_VARIABLE: shlex.join(engine.command)})
 
@@ -497,3 +508,59 @@ async def test_the_pre_job_inspection_is_bounded_by_the_deadline(plugin, engine,
         await plugin.execute(context(tmp_path, deadline_seconds=2), plugin.validate(lease()))
     assert time.monotonic() - started < 20
     assert [call[0] for call in engine.calls()] == ['inspect']
+
+
+
+# Weight verification: only the sets the profile's stages load, every file `ok`.
+
+def test_the_real_pins_and_weights_register():
+    versions = engine_versions(MESH3D, inspect_report())
+    assert versions['aismith_engine_commit'] == 'f7466926135bd1cdb9801432ce9d5371ad441596'
+    assert versions['aismith_sources_lock'] == MESH3D_RECIPE.sources_lock_sha256
+    assert versions['aismith_weights_lock'] == MESH3D_RECIPE.weights_lock_sha256
+    assert versions['blender'] == 'Blender 4.2.23 LTS'
+    assert versions[RECIPE_KEY] == describe_profile(MESH3D)['recipe_version']
+
+
+def test_a_missing_rig_checkpoint_is_allowed():
+    report = inspect_report()
+    assert {'weight_id': RIG_CHECKPOINT, 'status': 'missing'}.items() <= report['weights']['files'][-1].items()
+    assert _weight_problems(MESH3D_RECIPE, report['weights']) == []
+    report['weights']['files'] = [f for f in report['weights']['files'] if f['weight_id'] != RIG_CHECKPOINT]
+    assert engine_versions(MESH3D, report) == engine_versions(MESH3D, inspect_report())
+
+
+@pytest.mark.parametrize('status', ['unverified', 'unpinned', 'hash_mismatch', 'missing', 'size_mismatch'])
+def test_a_required_file_that_is_not_ok_fails(status):
+    report = inspect_report()
+    target = next(f for f in report['weights']['files'] if f['weight_id'] == 'dinov3-vitl16')
+    target['status'] = status
+    assert _weight_problems(MESH3D_RECIPE, report['weights']) == [
+        f'weight set dinov3-vitl16 is not verified ({status})']
+    with pytest.raises(EngineDrift, match='dinov3-vitl16 is not verified'):
+        engine_versions(MESH3D, report)
+
+
+@pytest.mark.parametrize('weight_id', MESH3D_RECIPE.weight_ids)
+def test_a_missing_required_set_fails(weight_id):
+    report = inspect_report()
+    report['weights']['files'] = [f for f in report['weights']['files'] if f['weight_id'] != weight_id]
+    with pytest.raises(EngineDrift, match=f'weight set {weight_id} is not reported'):
+        engine_versions(MESH3D, report)
+
+
+@pytest.mark.parametrize('weights', [{'ok': True, 'pinned': True}, {'ok': True, 'pinned': True, 'files': []},
+                                     {'files': None}, {}])
+def test_required_sets_reported_without_files_fail(weights):
+    problems = _weight_problems(MESH3D_RECIPE, weights)
+    assert problems == [f'weight set {w} is not reported' for w in MESH3D_RECIPE.weight_ids]
+    report = inspect_report()
+    report['weights'] = weights
+    with pytest.raises(EngineDrift, match='is not reported'):
+        engine_versions(MESH3D, report)
+
+
+def test_only_the_stages_weight_sets_are_required():
+    assert MESH3D_RECIPE.weight_ids == ('trellis2-4b-fp8', 'trellis-image-large-ss-decoder',
+                                        'dinov3-vitl16', 'birefnet-general', 'birefnet-general-lite')
+    assert RIG_CHECKPOINT not in MESH3D_RECIPE.weight_ids
