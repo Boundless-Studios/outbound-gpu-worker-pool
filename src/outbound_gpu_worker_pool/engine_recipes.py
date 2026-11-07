@@ -132,8 +132,8 @@ MESH3D_RECIPE = EngineRecipe(
     engine=AISMITH_ENGINE,
     # The tagged AISmith-3D engine release, with the digests of its two locks
     # at that commit (verified on the qualifying machine with inspect --full).
-    engine_tag='engine-v0.1.0',
-    engine_commit='f7466926135bd1cdb9801432ce9d5371ad441596',
+    engine_tag='engine-v0.2.0',
+    engine_commit='4162e2e9d49b0fb7c97caeca174ecb468e6b1260',
     sources_lock_sha256='34e7c16907f20268952173fb4f0c5b69dfd674e60a5017502ac2efe4fe19549b',
     weights_lock_sha256='c03f5a068628ebbff378c6f833a4ef04bd6fa06b0db6380a7514d6f5ac5c9d33',
     cuda_architecture='8.9',
@@ -168,8 +168,9 @@ MESH3D_RECIPE = EngineRecipe(
         ('determinism', 'mesh output is not deterministic: the same spec and seed gave a different '
                         'mesh (sha256, face count, watertightness), so provenance never claims '
                         'byte reproducibility'),
-        ('engine_pins', 'AISmith-3D tag engine-v0.1.0 (f7466926); lock digests computed at the tag '
-                        'and matched by inspect --full on the qualifying machine, 2026-11-07'),
+        ('engine_pins', 'AISmith-3D tag engine-v0.2.0 (4162e2e9), which adds the serve runner; lock '
+                        'digests computed at the tag, unchanged from engine-v0.1.0, and matched by '
+                        'inspect --full on the qualifying machine, 2026-11-07'),
         ('weights', 'each stage requires only the weight sets it loads; the rig checkpoint '
                     '(phase 2) is not required by mesh or clean'),
         ('min_vram_mb', 'kept at 24 GB by decision; measured engine peaks were about 6.9 GB '

@@ -500,7 +500,7 @@ PROFILES: dict[str, MachineProfile] = {
     SUBJECT12: MachineProfile(
         SUBJECT12, SUBJECT12_CAPABILITY, 'profile', _subject12_description,
         check_launch=_check_subject12_launch),
-    # Qualified at AISmith-3D engine-v0.1.0 (see engine_recipes for the pins
+    # Qualified at AISmith-3D engine-v0.2.0 (see engine_recipes for the pins
     # and the measured scope).
     MESH3D: MachineProfile(
         MESH3D, MESH3D_MESH_CAPABILITY, '', None,

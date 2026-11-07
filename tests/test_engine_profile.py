@@ -29,7 +29,7 @@ from test_service import ECHO, OUTPUT_BYTES, WORKER_A, _harness, _manifest, _sub
 
 NOT_QUALIFIED = f'{MESH3D} is not qualified yet'
 PINS = ('engine_tag', 'engine_commit', 'sources_lock_sha256', 'weights_lock_sha256')
-REAL_PINS = {'engine_tag': 'engine-v0.1.0', 'engine_commit': 'f7466926135bd1cdb9801432ce9d5371ad441596',
+REAL_PINS = {'engine_tag': 'engine-v0.2.0', 'engine_commit': '4162e2e9d49b0fb7c97caeca174ecb468e6b1260',
              'sources_lock_sha256': '34e7c16907f20268952173fb4f0c5b69dfd674e60a5017502ac2efe4fe19549b',
              'weights_lock_sha256': 'c03f5a068628ebbff378c6f833a4ef04bd6fa06b0db6380a7514d6f5ac5c9d33'}
 
@@ -71,7 +71,7 @@ def test_the_engine_profile_describes_its_declared_recipe():
     assert 'measured' in description['provenance']['mesh_deadline_seconds']
     assert 'front view only' in description['provenance']['scope']
     assert 'not deterministic' in description['provenance']['determinism']
-    assert 'engine-v0.1.0' in description['provenance']['engine_pins']
+    assert 'engine-v0.2.0' in description['provenance']['engine_pins']
     recipe = description.pop('recipe_version')
     assert recipe == engine_recipe_version(description)
 
