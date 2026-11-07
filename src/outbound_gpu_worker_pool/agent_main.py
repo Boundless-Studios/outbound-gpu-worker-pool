@@ -13,6 +13,12 @@ running ComfyUI, the profile's capability runs only through the profile plugin
 every other approved template keeps the generic `comfy-workflow` plugin. Without the variable nothing
 changes. `build_agent_from_env` itself never reads it, so callers that wire
 their own profile plugin keep full control.
+
+An engine profile (`mesh3d-24gb-standard`) named alone in `MVS_WORKER_PROFILE`
+runs a dedicated engine worker instead: startup runs `aismith-engine inspect
+--full` against the recipe, and the agent registers only the engine plugin's
+capabilities and the engine's runtime versions, at concurrency 1. An engine
+profile never shares a worker with another profile or GPU plugin.
 """
 
 import json
@@ -109,7 +115,14 @@ KNOWN_PLUGINS: dict[str, Callable[[Mapping[str, str]], GpuExecutorPlugin]] = {
 def build_agent_from_env(
     environment: Mapping[str, str],
     profile_plugin: GpuExecutorPlugin | Sequence[GpuExecutorPlugin] | None = None,
+    *,
+    exclusive: bool = False,
 ) -> WorkerAgent:
+    """The agent for this machine.
+
+    `exclusive` runs only the given profile plugins, ignoring
+    `OGWP_WORKER_PLUGINS` (an engine worker; see `prepare_engine_profile`).
+    """
     coordinator_url = _required(environment, "OGWP_WORKER_COORDINATOR_URL")
     worker_id = _required(environment, "OGWP_WORKER_ID")
     auth = environment.get("OGWP_WORKER_AUTH", STATIC_AUTH)
@@ -128,7 +141,11 @@ def build_agent_from_env(
         else tuple(profile_plugin) if isinstance(profile_plugin, Sequence)
         else (profile_plugin,)
     )
-    if not profile_plugins:
+    if exclusive:
+        if not profile_plugins:
+            raise ValueError("an exclusive agent needs its profile plugin")
+        plugins = profile_plugins
+    elif not profile_plugins:
         plugins = tuple(_plugin(name, environment) for name in names)
     else:
         # The profiles' capabilities leave the generic plugin entirely: an agent
@@ -233,13 +250,66 @@ async def prepare_mixed_profiles(
     return prepared, plugins
 
 
-async def main(environment: Mapping[str, str] = os.environ) -> int:
-    prepared, profile_plugins = await prepare_mixed_profiles(environment)
-    agent = (
-        build_agent_from_env(prepared)
-        if not profile_plugins
-        else build_agent_from_env(prepared, profile_plugin=profile_plugins)
+async def prepare_engine_profile(
+    environment: Mapping[str, str],
+) -> tuple[dict[str, str], GpuExecutorPlugin] | None:
+    """The engine worker's environment and plugin, or None when no engine profile is named.
+
+    An engine profile runs alone: listed with any other profile, beside
+    `OGWP_WORKER_PLUGINS` other than `aismith-engine`, or at a concurrency
+    other than 1, it is refused before the engine is touched. Startup runs
+    `aismith-engine inspect --full` and refuses to start on any drift from the
+    recipe.
+    """
+    names = [name.strip() for name in environment.get(PROFILE_VARIABLE, "").split(",") if name.strip()]
+    if not names:
+        return None
+    from outbound_gpu_worker_pool.machine_profiles import PROFILES, parse_profiles
+
+    engines = [name for name in names if name in PROFILES and PROFILES[name].kind == "engine"]
+    if not engines:
+        return None
+    if len(names) > 1:
+        raise ValueError(
+            f"{engines[0]} is an engine profile and runs alone on its worker; "
+            f"{PROFILE_VARIABLE} lists {', '.join(names)}. Run the other profiles "
+            "as a separate worker"
+        )
+    (profile,) = parse_profiles(names[0])
+    from outbound_gpu_worker_pool.engine import (
+        ENGINE_PLUGIN_ID,
+        engine_plugin_from_env,
+        prepare_engine_environment,
     )
+
+    others = [
+        name.strip()
+        for name in environment.get("OGWP_WORKER_PLUGINS", "").split(",")
+        if name.strip() and name.strip() != ENGINE_PLUGIN_ID
+    ]
+    if others:
+        raise ValueError(
+            f"an engine worker runs only the {ENGINE_PLUGIN_ID} plugin; remove "
+            f"{', '.join(others)} from OGWP_WORKER_PLUGINS"
+        )
+    if environment.get("OGWP_WORKER_CONCURRENCY", "1").strip() != "1":
+        raise ValueError("an engine worker runs one job at a time; OGWP_WORKER_CONCURRENCY must be 1")
+    prepared = {**environment, **await prepare_engine_environment(profile, dict(environment))}
+    return prepared, engine_plugin_from_env(profile, prepared)
+
+
+async def main(environment: Mapping[str, str] = os.environ) -> int:
+    engine = await prepare_engine_profile(environment)
+    if engine is not None:
+        prepared, plugin = engine
+        agent = build_agent_from_env(prepared, profile_plugin=plugin, exclusive=True)
+    else:
+        prepared, profile_plugins = await prepare_mixed_profiles(environment)
+        agent = (
+            build_agent_from_env(prepared)
+            if not profile_plugins
+            else build_agent_from_env(prepared, profile_plugin=profile_plugins)
+        )
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for number in (signal.SIGTERM, signal.SIGINT):
