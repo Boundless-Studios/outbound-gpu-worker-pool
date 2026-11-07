@@ -1,0 +1,160 @@
+# The 3D engine worker (mesh3d-24gb-standard). Images must be approved immutable
+# digests (checked by verify.py). Docker Engine >=28 is required for isolated
+# bridge gateway mode. This project never runs beside `ogwp-hardened` (H3): the
+# GPU is time-shared through switch.sh, and run.sh refuses to start beside it.
+name: ogwp-hardened-3d
+x-sandbox: &sandbox
+  user: "65532:65532"
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  pids_limit: 256
+  init: true
+  # The gated supervisor owns restarts, including after a host reboot.
+  restart: "no"
+  logging:
+    driver: json-file
+    options: {max-size: 10m, max-file: "2"}
+services:
+  egress:
+    <<: *sandbox
+    image: ${OGWP_AGENT_IMAGE:?approved immutable agent image required}
+    entrypoint: [python, /opt/ogwp/egress_proxy.py]
+    environment:
+      OGWP_EGRESS_HOSTS: ${OGWP_EGRESS_HOSTS:?exact outbound HTTPS hosts required}
+      PYTHONDONTWRITEBYTECODE: "1"
+    networks: [workload, internet]
+    mem_limit: 128m
+    memswap_limit: 128m
+    cpus: 0.5
+    tmpfs: ["/tmp:size=16m,mode=1777,noexec,nosuid,nodev"]
+  engine:
+    <<: *sandbox
+    image: ${OGWP_ENGINE_IMAGE:?approved immutable engine image required}
+    # Torch, onnxruntime and Blender each start a thread per visible core; the
+    # PID controller counts threads.
+    pids_limit: 1024
+    entrypoint:
+      - /opt/aismith/.venv/bin/python
+      - -c
+      - "import os,sys; [os.makedirs(p,exist_ok=True) for p in ('/scratch/engine', '/scratch/refiner/input', '/scratch/refiner/output', '/scratch/refiner/temp', '/scratch/aismith-data', '/scratch/cache', '/jit/tmp')]; os.execv(sys.executable,[sys.executable,'-m','backend.engine',*sys.argv[1:]])"
+    # `aismith-engine serve`, loopback only (no --allow-private). The runner
+    # cleans its work root at startup and runs one job at a time.
+    command: [serve, --host, "127.0.0.1", --port, "8190", --work-root, /scratch/engine]
+    working_dir: /opt/aismith
+    environment:
+      HOME: /scratch
+      XDG_CACHE_HOME: /scratch/cache
+      XDG_CONFIG_HOME: /scratch/cache/config
+      HF_HOME: /scratch/cache/huggingface
+      TMPDIR: /jit/tmp
+      TRITON_CACHE_DIR: /jit/triton
+      TORCHINDUCTOR_CACHE_DIR: /jit/torch
+      TORCH_EXTENSIONS_DIR: /jit/torch-extensions
+      CUDA_CACHE_PATH: /jit/cuda
+      PYTHONDONTWRITEBYTECODE: "1"
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      AISMITH_OFFLINE: "1"
+      AISMITH_GPU_PREFLIGHT_MAX_WAIT_SECONDS: "0"
+      TRELLIS_REFINER_DIR: /opt/trellis2-refiner
+      BLENDER_EXE: /opt/blender/blender
+      U2NET_HOME: /opt/rembg
+      AISMITH_DATA_DIR: /scratch/aismith-data
+    # No default route, no host bridge address, no external DNS forwarding.
+    networks: [workload]
+    dns: [127.0.0.1]
+    # Mesh RSS peaked about 9 GB in qualification; tmpfs below is charged here too.
+    mem_limit: ${OGWP_ENGINE_MEMORY:-24g}
+    memswap_limit: ${OGWP_ENGINE_MEMORY:-24g}
+    cpus: ${OGWP_ENGINE_CPUS:-8}
+    shm_size: 1g
+    tmpfs:
+      # Per-job inputs (images 20 MiB each, a mesh 256 MiB), outputs and the
+      # stage's intermediates; the runner deletes each job's directory.
+      - /scratch:size=4g,uid=65532,gid=65532,mode=0700,noexec,nosuid,nodev
+      # Triton/torch JIT and the CUDA PTX cache must mmap generated code. Only
+      # this bounded, disposable cache is executable; code and models are not.
+      - /jit:size=1g,uid=65532,gid=65532,mode=0700,exec,nosuid,nodev
+      - /tmp:size=256m,mode=1777,noexec,nosuid,nodev
+      - /home:size=1m,mode=0755,noexec,nosuid,nodev
+      # The engine's weight-hash cache (.weights-verified.json) lives in the
+      # TRELLIS models root; the model subtrees are bound read-only below it.
+      - /opt/trellis2-refiner/models:size=16m,uid=65532,gid=65532,mode=0700,noexec,nosuid,nodev
+      # ComfyUI-Trellis2 copies a helper config here on every load; not a model.
+      - /opt/trellis2-refiner/models/microsoft/TRELLIS.2-4B:size=1m,uid=65532,gid=65532,mode=0700,noexec,nosuid,nodev
+    volumes:
+      - type: bind
+        source: ${OGWP_TRELLIS_MODELS_DIR:?curated TRELLIS model store required}/visualbruno
+        target: /opt/trellis2-refiner/models/visualbruno
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${OGWP_TRELLIS_MODELS_DIR:?curated TRELLIS model store required}/microsoft/TRELLIS-image-large
+        target: /opt/trellis2-refiner/models/microsoft/TRELLIS-image-large
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${OGWP_TRELLIS_MODELS_DIR:?curated TRELLIS model store required}/facebook
+        target: /opt/trellis2-refiner/models/facebook
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${OGWP_REMBG_MODELS_DIR:?curated rembg model store required}
+        target: /opt/rembg/models
+        read_only: true
+        bind: {create_host_path: false}
+    healthcheck:
+      test: [CMD, /opt/aismith/.venv/bin/python, -c, "import json,urllib.request; r=json.load(urllib.request.urlopen('http://127.0.0.1:8190/health', timeout=3)); assert r.get('ok') is True"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+  agent:
+    <<: *sandbox
+    image: ${OGWP_AGENT_IMAGE:?approved immutable agent image required}
+    entrypoint: [python, -m, outbound_gpu_worker_pool.agent_main]
+    # Shares only the network namespace, never PID/filesystem/credentials.
+    network_mode: service:engine
+    depends_on:
+      engine: {condition: service_healthy}
+      egress: {condition: service_started}
+    env_file: ${OGWP_AGENT_ENV:?private agent environment file required}
+    # These override the private env file.
+    environment:
+      HOME: /scratch
+      PYTHONDONTWRITEBYTECODE: "1"
+      HTTPS_PROXY: http://egress:3128
+      HTTP_PROXY: http://egress:3128
+      NO_PROXY: localhost,127.0.0.1,::1
+      MVS_WORKER_PROFILE: mesh3d-24gb-standard
+      OGWP_ENGINE_URL: http://127.0.0.1:8190
+      OGWP_WORKER_PLUGINS: aismith-engine
+      OGWP_WORKER_CONCURRENCY: "1"
+      OGWP_WORKER_WORKSPACE: /scratch/jobs
+      OGWP_WORKER_MAX_INPUT_BYTES: "268435456"
+      OGWP_COMFY_START_COMMAND: ""
+      MVS_ENGINE_COMMAND: ""
+      GOOGLE_APPLICATION_CREDENTIALS: /run/credentials/worker.json
+    mem_limit: 2g
+    memswap_limit: 2g
+    cpus: 2
+    # A drain finishes the current lease: the mesh deadline is 30 minutes.
+    stop_grace_period: 35m
+    tmpfs:
+      - /scratch:size=1g,uid=65532,gid=65532,mode=0700,noexec,nosuid,nodev
+      - /tmp:size=64m,mode=1777,noexec,nosuid,nodev
+    volumes:
+      - type: bind
+        source: ${OGWP_WORKER_CREDENTIAL:?dedicated 3D worker-only credential required}
+        target: /run/credentials/worker.json
+        read_only: true
+        bind: {create_host_path: false}
+networks:
+  workload:
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
+      com.docker.network.bridge.gateway_mode_ipv6: isolated
+  internet: {}
