@@ -599,6 +599,9 @@ egress proxy, but no GPU. The `engine` container holds the GPU, the read-only mo
 and the engine runtimes, and has no credentials. It runs `aismith-engine serve` on
 loopback. The agent runs with `network_mode: service:engine`, the same pattern ComfyUI
 uses, so the two share only a loopback network.
+[`deploy/hardened-3d`](deploy/hardened-3d/README.md) is that deployment: the Compose project,
+its fail-closed gate and model-store manifest check, and `switch.sh`, which time-shares the GPU
+with H3 and never runs both.
 
 Over `http`, each job runs `GET /inspect` and the same drift check as `local`, then:
 1. `PUT` each input to `/jobs/<job>/inputs/<name>`.

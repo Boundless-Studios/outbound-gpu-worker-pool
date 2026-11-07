@@ -1,0 +1,17 @@
+# The H3 agent image pattern, for the 3D worker and its egress relay.
+# Build context: a clean export of this repository at a commit that includes the
+# engine plugin's HTTP transport (6f43b02 or later). The `aismith-engine` plugin
+# ships in the package, so no extra code is needed; the engine worker loads no
+# ComfyUI templates. Supply an approved Python 3.13 base image by full digest.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+WORKDIR /opt/ogwp/source
+COPY pyproject.toml README.md ./
+COPY src ./src
+RUN pip install --no-cache-dir '.[agent,google-auth]' && pip check \
+    && python -B -c "from outbound_gpu_worker_pool.engine import ENGINE_PLUGIN_ID, runner_url; \
+from outbound_gpu_worker_pool.machine_profiles import PROFILES; \
+assert ENGINE_PLUGIN_ID == 'aismith-engine' and PROFILES['mesh3d-24gb-standard'].kind == 'engine'; \
+assert runner_url({'OGWP_ENGINE_URL': 'http://127.0.0.1:8190'})"
+COPY deploy/hardened-3d/egress_proxy.py /opt/ogwp/egress_proxy.py
+USER 65532:65532

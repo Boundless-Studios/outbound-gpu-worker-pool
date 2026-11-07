@@ -1,0 +1,25 @@
+[Unit]
+Description=Gated isolated outbound GPU worker (3D engine)
+# Ordering only: at boot, a still-enabled H3 unit starts first and this one then
+# refuses (run.sh exits 3). switch.sh keeps exactly one of the two enabled.
+After=network-online.target ogwp-hardened.service
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+Type=simple
+ExecStart=/bin/bash %h/.local/share/ogwp-hardened-3d/hardened-3d/run.sh
+Restart=on-failure
+RestartSec=30
+# Exit 3: H3 holds the GPU. Retrying cannot help; switch.sh is the way in.
+RestartPreventExitStatus=3
+# Signal the supervisor; its EXIT handler drains the agent (up to 35 min)
+# before the engine stops.
+KillMode=process
+TimeoutStopSec=37min
+UMask=0077
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target
