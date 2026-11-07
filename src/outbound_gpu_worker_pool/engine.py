@@ -497,38 +497,21 @@ class AISmithEnginePlugin:
         if stage is None:
             raise PluginRequestRejected('unsupported capability')
         # The pre-job inspection spends the job's own execution time: an expired
-        # context starts no process, and inspect never outlives the deadline.
-        remaining = (context.deadline - datetime.now(UTC)).total_seconds()
-        if remaining <= 0:
+        # context starts no process and makes no runner call.
+        if (context.deadline - datetime.now(UTC)).total_seconds() <= 0:
             raise EngineTimedOut('the lease deadline passed before the engine was inspected')
-        inspect_timeout = min(remaining, self.inspect_timeout_seconds)
-        try:
-            report = await self._inspect(timeout=inspect_timeout)
-        except InspectTimedOut:
-            if inspect_timeout < self.inspect_timeout_seconds:
-                raise EngineTimedOut('the lease deadline passed while the engine was inspected') from None
-            raise
-        actual = engine_versions(self.profile, report)
-        if actual != self.versions:
-            raise EngineDrift('the engine runtime changed; restart the worker and resolve a new recipe')
-        workdir = context.workspace / 'engine'
-        workdir.mkdir(parents=True)
-        bound = request.inputs[INPUTS_PAYLOAD_KEY]
-        assert isinstance(bound, dict)
-        inputs = {name: context.input_paths[key] for name, key in bound.items()}
-        settings = {name: request.inputs[name] for name, _ in stage.settings if name in request.inputs}
-        remaining = (context.deadline - datetime.now(UTC)).total_seconds()
-        timeout = min(float(stage.deadline_seconds), remaining)
-        if timeout <= 0:
-            raise EngineTimedOut('the lease deadline passed before the stage started')
         cancel = self._cancels.setdefault(context.job_id, asyncio.Event())
         try:
             if self.engine_url is not None:
-                result, output = await self._run_http(context, stage, inputs, settings, timeout,
-                                                      workdir, cancel)
+                # The whole sidecar job, inspect to output, races cancellation
+                # and the lease deadline.
+                actual, result, output = await self._raced(
+                    context, cancel, self._http_job(context, request, stage, cancel))
             else:
-                result, output = await self._run_local(context, stage, inputs, settings, timeout,
-                                                       workdir)
+                actual, result, output = await self._local_job(context, request, stage)
+            # A cancelled job never returns an output, however late the cancel came.
+            if cancel.is_set() or context.cancel.is_set():
+                raise EngineCancelled('the job was cancelled; its output is discarded')
         finally:
             self._cancels.pop(context.job_id, None)
         await context.progress(100)
@@ -556,6 +539,82 @@ class AISmithEnginePlugin:
                             model_id=f'{AISMITH_ENGINE}/{stage.stage}',
                             model_version=self.versions['aismith_engine_commit'],
                             seed=request.seed, diagnostics=_bounded(diagnostics))
+
+    async def _preflight(self, context: ExecutionContext) -> dict[str, str]:
+        """`inspect` bounded by the job's deadline, and the drift check."""
+        remaining = (context.deadline - datetime.now(UTC)).total_seconds()
+        if remaining <= 0:
+            raise EngineTimedOut('the lease deadline passed before the engine was inspected')
+        inspect_timeout = min(remaining, self.inspect_timeout_seconds)
+        try:
+            report = await self._inspect(timeout=inspect_timeout)
+        except InspectTimedOut:
+            if inspect_timeout < self.inspect_timeout_seconds:
+                raise EngineTimedOut('the lease deadline passed while the engine was inspected') from None
+            raise
+        actual = engine_versions(self.profile, report)
+        if actual != self.versions:
+            raise EngineDrift('the engine runtime changed; restart the worker and resolve a new recipe')
+        return actual
+
+    @staticmethod
+    def _staged(context: ExecutionContext, request: ValidatedRequest,
+                stage: EngineStage) -> tuple[dict[str, Path], dict[str, Any], float, Path]:
+        """The stage's inputs, settings, time budget and work directory."""
+        workdir = context.workspace / 'engine'
+        workdir.mkdir(parents=True)
+        bound = request.inputs[INPUTS_PAYLOAD_KEY]
+        assert isinstance(bound, dict)
+        inputs = {name: context.input_paths[key] for name, key in bound.items()}
+        settings = {name: request.inputs[name] for name, _ in stage.settings if name in request.inputs}
+        remaining = (context.deadline - datetime.now(UTC)).total_seconds()
+        timeout = min(float(stage.deadline_seconds), remaining)
+        if timeout <= 0:
+            raise EngineTimedOut('the lease deadline passed before the stage started')
+        return inputs, settings, timeout, workdir
+
+    async def _local_job(self, context: ExecutionContext, request: ValidatedRequest,
+                         stage: EngineStage) -> tuple[dict[str, str], dict[str, Any], Path]:
+        actual = await self._preflight(context)
+        inputs, settings, timeout, workdir = self._staged(context, request, stage)
+        result, output = await self._run_local(context, stage, inputs, settings, timeout, workdir)
+        return actual, result, output
+
+    async def _http_job(self, context: ExecutionContext, request: ValidatedRequest, stage: EngineStage,
+                        cancel: asyncio.Event) -> tuple[dict[str, str], dict[str, Any], Path]:
+        actual = await self._preflight(context)
+        inputs, settings, timeout, workdir = self._staged(context, request, stage)
+        result, output = await self._run_http(context, stage, inputs, settings, timeout, workdir, cancel)
+        return actual, result, output
+
+    @staticmethod
+    async def _raced(context: ExecutionContext, cancel: asyncio.Event, job: Any) -> Any:
+        """Run `job` until it finishes, the job is cancelled, or the lease deadline passes.
+
+        Cancellation wins a tie, so a cancelled job never returns its result.
+        On cancel or deadline the job task is cancelled, and its own cleanup
+        (`POST cancel` while the stage runs, then `DELETE`) runs before this returns.
+        """
+        work = asyncio.ensure_future(job)
+        waiters = {asyncio.ensure_future(context.cancel.wait()), asyncio.ensure_future(cancel.wait())}
+        remaining = (context.deadline - datetime.now(UTC)).total_seconds()
+        try:
+            done, _ = await asyncio.wait({work, *waiters}, timeout=max(0.0, remaining),
+                                         return_when=asyncio.FIRST_COMPLETED)
+            if done & waiters or cancel.is_set() or context.cancel.is_set():
+                raise EngineCancelled('the job was cancelled; the engine runner job was cancelled')
+            if work in done:
+                return work.result()
+            raise EngineTimedOut('the lease deadline passed during the engine job; '
+                                 'the engine runner job was cancelled')
+        finally:
+            for waiter in waiters:
+                waiter.cancel()
+            if not work.done():
+                work.cancel()
+            # Wait for the job's own cleanup; its outcome no longer matters.
+            with suppress(asyncio.CancelledError, Exception):
+                await work
 
     # The local transport: the CLI as a subprocess.
 
@@ -634,69 +693,59 @@ class AISmithEnginePlugin:
     async def _run_http(self, context: ExecutionContext, stage: EngineStage, inputs: dict[str, Path],
                         settings: dict[str, Any], timeout: float, workdir: Path,
                         cancel: asyncio.Event) -> tuple[dict[str, Any], Path]:
+        """Uploads, run and output fetch under one absolute stage deadline.
+
+        The whole transfer, not each HTTP operation, gets `timeout`: a runner
+        that trickles bytes cannot hold the worker past it.
+        """
         job = context.job_id
         if not RUNNER_JOB_ID.fullmatch(job):
             raise EngineFailed('the job id is not a valid engine runner job id')
-        started = asyncio.get_running_loop().time()
-
-        def left() -> float:
-            return timeout - (asyncio.get_running_loop().time() - started)
-
+        state = {'running': False}
         try:
-            for name, path in inputs.items():
-                if left() <= 0:
-                    raise EngineTimedOut('the stage deadline passed while uploading inputs')
-                # Bytes, not a stream, so the request carries the Content-Length
-                # the runner requires (it answers 411 to a chunked body).
-                response = await self._runner('PUT', f'/jobs/{job}/inputs/{name}',
-                                              content=path.read_bytes(), timeout=left())
-                if response.status_code != 204:
-                    raise EngineFailed(f'the engine runner refused input {name} ({response.status_code})')
-            result = await self._http_stage(context, stage, inputs, settings, left(), cancel)
-            self._checked_result(result, stage)
-            output = result.get('output')
-            if not isinstance(output, dict) or output.get('url') != f'/jobs/{job}/output':
-                raise EngineFailed('the engine runner reported ok without its output URL')
-            if left() <= 0:
-                raise EngineTimedOut('the stage deadline passed before the output was fetched')
-            path = await self._fetch_output(job, output, workdir / f'{stage.stage}.glb', left())
+            try:
+                async with asyncio.timeout(timeout):
+                    for name, path in inputs.items():
+                        # Bytes, not a stream, so the request carries the Content-Length
+                        # the runner requires (it answers 411 to a chunked body).
+                        response = await self._runner('PUT', f'/jobs/{job}/inputs/{name}',
+                                                      content=path.read_bytes(), timeout=timeout)
+                        if response.status_code != 204:
+                            raise EngineFailed(f'the engine runner refused input {name} '
+                                               f'({response.status_code})')
+                    result = await self._http_stage(context, stage, inputs, settings, timeout, state)
+                    self._checked_result(result, stage)
+                    output = result.get('output')
+                    if not isinstance(output, dict) or output.get('url') != f'/jobs/{job}/output':
+                        raise EngineFailed('the engine runner reported ok without its output URL')
+                    path = await self._fetch_output(job, output, workdir / f'{stage.stage}.glb', timeout)
+            except TimeoutError:
+                raise EngineTimedOut(f'the engine job exceeded its {timeout:.0f} s deadline; '
+                                     'the engine runner job was cancelled') from None
             return result, self._checked_output(path, output)
         finally:
+            # A stage still running on the runner (deadline, cancel, or our own
+            # cancellation) is cancelled first.
+            if state['running']:
+                with suppress(EngineFailed):
+                    await self._runner('POST', f'/jobs/{job}/cancel')
             # Always: only DELETE removes the job's work directory on the runner
             # (fetching the output does not), and it cancels a running job.
             with suppress(EngineFailed):
                 await self._runner('DELETE', f'/jobs/{job}')
 
     async def _http_stage(self, context: ExecutionContext, stage: EngineStage, inputs: dict[str, Path],
-                          settings: dict[str, Any], timeout: float,
-                          cancel: asyncio.Event) -> dict[str, Any]:
+                          settings: dict[str, Any], timeout: float, state: dict[str, bool]) -> dict[str, Any]:
         job = context.job_id
-        if timeout <= 0:
-            raise EngineTimedOut('the stage deadline passed before the stage started')
-        # The runner enforces the deadline too; the client keeps its own.
-        run = asyncio.ensure_future(self._runner('POST', f'/jobs/{job}/run', timeout=timeout + 30, json={
+        # The runner enforces the deadline too; the client keeps its own (the
+        # caller's absolute timeout and cancellation race).
+        state['running'] = True
+        response = await self._runner('POST', f'/jobs/{job}/run', timeout=timeout + 30, json={
             'schema_version': ENGINE_SPEC_SCHEMA_VERSION, 'stage': stage.stage,
             'inputs': sorted(inputs), 'settings': settings,
             'deadline_seconds': max(1, min(MAX_RUNNER_DEADLINE_SECONDS, int(timeout))),
-        }))
-        waiters = {asyncio.ensure_future(context.cancel.wait()), asyncio.ensure_future(cancel.wait())}
-        try:
-            done, _ = await asyncio.wait({run, *waiters}, timeout=timeout,
-                                         return_when=asyncio.FIRST_COMPLETED)
-            if run not in done:
-                if done:
-                    raise EngineCancelled('the job was cancelled; the engine runner cancelled it')
-                raise EngineTimedOut(f'the engine exceeded its {timeout:.0f} s deadline; '
-                                     'the engine runner cancelled it')
-            response = run.result()
-        finally:
-            for waiter in waiters:
-                waiter.cancel()
-            if not run.done():
-                run.cancel()
-                # Also on our own cancellation: never leave a stage running.
-                with suppress(EngineFailed, asyncio.CancelledError):
-                    await self._runner('POST', f'/jobs/{job}/cancel')
+        })
+        state['running'] = False
         if response.status_code != 200:
             raise EngineFailed(f'the engine runner answered {response.status_code} to run')
         try:
