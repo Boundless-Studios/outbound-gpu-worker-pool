@@ -28,7 +28,7 @@ from outbound_gpu_worker_pool.plugins import ExecutionContext, PluginRequestReje
 from test_service import WORKER_A, _harness, _manifest, _submission
 
 FAKE_ENGINE = r'''
-import hashlib, json, subprocess, sys, time
+import hashlib, json, os, subprocess, sys, time
 from pathlib import Path
 
 here = Path(__file__).parent
@@ -36,6 +36,8 @@ control = json.loads((here / 'control.json').read_text())
 args = sys.argv[1:]
 with (here / 'calls.jsonl').open('a') as log:
     log.write(json.dumps(args) + '\n')
+(here / 'env.json').write_text(json.dumps({key: os.environ.get(key) for key in (
+    'AISMITH_OFFLINE', 'TRELLIS_REFINER_DIR', 'BLENDER_EXE', 'U2NET_HOME', 'UNIRIG_DIR', 'AISMITH_DATA_DIR')}))
 if args[0] == 'inspect':
     time.sleep(control.get('inspect_sleep', 0))
     print(json.dumps(control['inspect']))

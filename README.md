@@ -550,6 +550,68 @@ test-only unqualified copy:
 
 A coordinator that cannot import `machine_profiles` refuses every engine capability.
 
+### Running the 3D engine worker
+
+The engine runs on its own worker identity, never beside H3 or any other profile. On a
+shared 4090, stop the H3 worker before you start the engine worker. Set
+`MVS_WORKER_PROFILE=mesh3d-24gb-standard` alone, and the agent entrypoint
+(`python -m outbound_gpu_worker_pool.agent_main`) starts an engine worker:
+- startup runs `inspect --full` against the recipe, and any drift starts no agent;
+- the worker registers only `mesh.trellis2.image_to_mesh.v1` and `mesh.blender.clean.v1`,
+  with the engine's runtime versions, at concurrency 1;
+- it refuses the engine profile listed with any other profile, any `OGWP_WORKER_PLUGINS`
+  other than `aismith-engine`, and `OGWP_WORKER_CONCURRENCY` other than 1.
+
+The plugin has two transports. The worker chooses one from the environment:
+
+| Transport | Selected by | Use |
+| --- | --- | --- |
+| `http` | `OGWP_ENGINE_URL` set | The hardened worker. The plugin talks to an `aismith-engine serve` sidecar |
+| `local` | `OGWP_ENGINE_URL` unset | Development and tests. The plugin runs the CLI as a subprocess in its own process group |
+
+| Variable | Meaning |
+| --- | --- |
+| `OGWP_ENGINE_URL` | The sidecar runner, for example `http://127.0.0.1:8190`. Loopback or private addresses only, as for `OGWP_COMFY_URL` |
+| `MVS_ENGINE_COMMAND` | The `local` engine command (default `aismith-engine`), for example `/opt/aismith/.venv/bin/aismith-engine` |
+| `OGWP_WORKER_WORKSPACE` | The root for per-job directories. A job's engine work directory is `<root>/<job>/engine` |
+| `MVS_ENGINE_INSPECT_TIMEOUT_SECONDS` | The bound on each per-job `inspect`, default 600. The job's own deadline also bounds it |
+| `MVS_ENGINE_FULL_INSPECT_TIMEOUT_SECONDS` | The bound on the startup `inspect --full`, default 1800 |
+| `MVS_ENGINE_KILL_GRACE_SECONDS` | `local` only: the time between SIGTERM and SIGKILL of the stage's process group, default 10 |
+
+Stage timeouts are not configurable. Each stage runs for at most the smaller of its profile
+deadline and the lease's.
+
+The engine reads its runtime roots itself: `TRELLIS_REFINER_DIR`, `BLENDER_EXE`,
+`U2NET_HOME`, `UNIRIG_DIR` and `AISMITH_DATA_DIR`. With `local`, the worker passes its
+environment through unchanged and always sets `AISMITH_OFFLINE=1`, which the CLI also sets.
+With `http`, the sidecar's own environment holds them.
+
+```bash
+OGWP_WORKER_COORDINATOR_URL=https://studio.example/pool \
+OGWP_WORKER_ID=ilya-desktop-3d OGWP_WORKER_AUTH=static OGWP_WORKER_TOKEN=... \
+MVS_WORKER_PROFILE=mesh3d-24gb-standard \
+OGWP_ENGINE_URL=http://127.0.0.1:8190 \
+python -m outbound_gpu_worker_pool.agent_main
+```
+
+**The hardened sidecar.** The `agent` container holds the worker credential and the
+egress proxy, but no GPU. The `engine` container holds the GPU, the read-only model stores
+and the engine runtimes, and has no credentials. It runs `aismith-engine serve` on
+loopback. The agent runs with `network_mode: service:engine`, the same pattern ComfyUI
+uses, so the two share only a loopback network.
+
+Over `http`, each job runs `GET /inspect` and the same drift check as `local`, then:
+1. `PUT` each input to `/jobs/<job>/inputs/<name>`.
+2. `POST /jobs/<job>/run` with the deadline. The plugin also enforces the deadline itself.
+3. Check the result exactly as for `local`: status, stage, schema and engine identity.
+4. `GET` the output. Its GLB magic, size and sha256 are checked on the fetched bytes and
+   against `X-Sha256` and `Content-Length`.
+5. `DELETE /jobs/<job>`, always.
+
+A lease cancellation or a deadline sends `POST /jobs/<job>/cancel` first. Enrolment runs
+`GET /inspect?full=1`. The plugin never sends runner requests through the worker's egress
+proxy.
+
 A coordinator publishes the same templates' schemas with
 `OGWP_CAPABILITY_PLUGINS=comfy-workflow`. It reads the packaged template directory for the
 schemas only and never opens a connection to any runtime.
