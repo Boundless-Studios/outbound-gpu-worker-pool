@@ -501,39 +501,54 @@ Profiles are entries in `machine_profiles.PROFILES`. Each entry gives the profil
 capability, its template directory, a fingerprinted description, its attested inputs and its
 launch-flag check. Adding a profile does not change any existing recipe version.
 
-### 3D engine profile (provisional)
+### 3D engine profile
 
 `mesh3d-24gb-standard` is an engine profile (`kind='engine'`). It runs AISmith-3D's
 `aismith-engine` CLI instead of a ComfyUI template, and serves
 `mesh.trellis2.image_to_mesh.v1` and `mesh.blender.clean.v1`. Its recipe lives in
-`engine_recipes.py`: the engine release and commit, the sources-lock and weights-lock
-digests, CUDA architecture 8.9, Blender 4.2.x LTS, a 24,000 MB minimum, and per capability
-its attested inputs and deadline (mesh: `resolution` and `seed`, 7,200 s; clean:
-`quality_tier` or `target_triangles`, 1,800 s). The recipe version fingerprints that
-description, including the `qualified` flag.
+`engine_recipes.py`:
 
-**The profile is unqualified and inert.** Its engine pins are unset, and its numbers come
-from AISmith-3D's own notes and code, not from a Studio measurement. The provenance for each
-number is in the recipe. Until it is qualified:
+- the engine release `engine-v0.1.0` (commit `f7466926`), with the sources-lock and
+  weights-lock digests at that commit;
+- CUDA architecture 8.9 and Blender 4.2.x LTS;
+- a 24,000 MB minimum;
+- per capability, its attested inputs, deadline and weight sets:
+  - mesh: `resolution` and `seed`, 1,800 s;
+  - clean: `quality_tier` or `target_triangles`, 600 s.
 
-- `parse_profiles`, `prepare_environment` and `prepare_mixed_profiles` refuse it before
-  touching any runtime. So does each profile plugin's constructor.
-- The coordinator refuses a heartbeat that advertises its capabilities, or whose runtime
-  versions name its profile or recipe, with 422 `profile_not_qualified`. It does not drop the
-  capabilities and accept the rest.
-- `submit` raises `ProfileNotQualified` for its capabilities and for jobs that pin its recipe
-  or profile. Leasing never hands one out, whatever a store holds, and a completion for one
-  is rejected.
-- A coordinator that cannot import `machine_profiles` refuses every engine capability.
+The recipe version fingerprints that description, including the `qualified` flag.
 
-The `aismith-engine` plugin (`engine.py`) and engine enrolment (`inspect --full`) are
-implemented and tested against a fake engine. Each job re-runs `inspect` and fails closed if
-the engine commit, a lock digest, weight pinning, GPU architecture or Blender series has
-drifted. Qualification will set the engine tag, commit and both lock digests from a tagged
-AISmith-3D release. It will replace the provisional VRAM floor and deadlines with Studio
-measurements on the target card, decide whether the profile may share a runtime
-(`mixed_mode` is False today), and set `qualified=True`. Each of these changes the recipe
-version.
+**The profile is qualified, on a stated scope.** It was measured on one RTX 4090 on
+2026-11-05 and 2026-11-06:
+- the front view only, mesh resolution 1024, and the standard clean tier without view
+  projection;
+- mesh engine peak about 6.9 GB, wall time up to 3:27;
+- clean engine peak about 3 GB, up to 49 s.
+
+Mesh output is not deterministic: the same spec and seed gave a different mesh.
+
+The 24 GB minimum, the deadlines and `mixed_mode=False` (the profile never shares a runtime
+with H3) are decisions recorded in the recipe's provenance. A smaller card gets its own
+profile after a run on such a card.
+
+The `aismith-engine` plugin (`engine.py`) re-runs `inspect` before each job. It fails
+closed if any of these has drifted:
+- the engine commit or a lock digest;
+- a file of any weight set the profile's stages load. Sets no stage loads, such as the
+  phase-2 rig checkpoint, are not required;
+- the GPU architecture or VRAM;
+- the Blender series;
+- offline mode.
+
+Enrolment runs `inspect --full`.
+
+The refusal paths for an unqualified engine profile stay in place, tested against a
+test-only unqualified copy:
+- enrolment and the plugin constructors;
+- the coordinator's 422 `profile_not_qualified` on registration;
+- `submit`, leasing and completion.
+
+A coordinator that cannot import `machine_profiles` refuses every engine capability.
 
 A coordinator publishes the same templates' schemas with
 `OGWP_CAPABILITY_PLUGINS=comfy-workflow`. It reads the packaged template directory for the

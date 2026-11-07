@@ -500,13 +500,13 @@ PROFILES: dict[str, MachineProfile] = {
     SUBJECT12: MachineProfile(
         SUBJECT12, SUBJECT12_CAPABILITY, 'profile', _subject12_description,
         check_launch=_check_subject12_launch),
-    # Provisional and unqualified: refused at enrolment, registration and
-    # dispatch until qualification sets its pins (see engine_recipes).
+    # Qualified at AISmith-3D engine-v0.1.0 (see engine_recipes for the pins
+    # and the measured scope).
     MESH3D: MachineProfile(
         MESH3D, MESH3D_MESH_CAPABILITY, '', None,
         attested_inputs=tuple(dict.fromkeys(
             name for stage in MESH3D_RECIPE.stages for name in stage.attested_inputs)),
-        mixed_mode=False, kind='engine', engine=MESH3D_RECIPE, qualified=False),
+        mixed_mode=False, kind='engine', engine=MESH3D_RECIPE, qualified=True),
 }
 # Kept for callers that map a ComfyUI profile to its capability directly.
 assert PROFILE_CAPABILITIES == {name: spec.capability_id for name, spec in PROFILES.items()

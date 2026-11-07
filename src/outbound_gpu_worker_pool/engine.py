@@ -117,11 +117,30 @@ def _section(report: dict[str, Any], *path: str) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _weight_problems(recipe: Any, weights: dict[str, Any]) -> list[str]:
+    """Every file of every weight set the recipe's stages load must verify `ok`.
+
+    Weight sets no stage of this recipe loads (the rig checkpoint, for a
+    mesh-and-clean profile) are not required; `unpinned`, `unverified`,
+    missing and mismatched files of a required set are all refused.
+    """
+    files = weights.get('files') if isinstance(weights.get('files'), list) else []
+    problems = []
+    for weight_id in recipe.weight_ids:
+        own = [f for f in files if isinstance(f, dict) and f.get('weight_id') == weight_id]
+        if not own:
+            problems.append(f'weight set {weight_id} is not reported')
+        bad = sorted({str(f.get('status')) for f in own if f.get('status') != 'ok'})
+        if bad:
+            problems.append(f'weight set {weight_id} is not verified ({", ".join(bad)})')
+    return problems
+
+
 def engine_versions(profile: str, report: dict[str, Any]) -> dict[str, str]:
     """The runtime versions an engine profile registers, from an `inspect` report.
 
     Raises EngineDrift when the report does not match the recipe's pins: the
-    engine commit and both lock digests, every weight pinned, a GPU of the
+    engine commit and both lock digests, every weight its stages load verified, a GPU of the
     recipe's architecture with enough VRAM, the TRELLIS native build's
     architecture, the Blender series, and offline mode.
     """
@@ -141,8 +160,7 @@ def engine_versions(profile: str, report: dict[str, Any]) -> dict[str, str]:
         )
         if actual is None or actual != expected
     ]
-    if weights.get('ok') is not True or weights.get('pinned') is not True:
-        problems.append('weights are not all present and pinned')
+    problems.extend(_weight_problems(recipe, weights))
     if report.get('offline') is not True:
         problems.append('the engine is not offline')
     if not re.fullmatch(rf'Blender {re.escape(recipe.blender_series)}\.\d+( LTS)?', blender):
