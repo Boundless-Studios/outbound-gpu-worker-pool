@@ -71,6 +71,8 @@ class FakeRunner:
                 match = re.fullmatch(rf'/jobs/{JOB}/inputs/(?P<name>front|back|left|right|mesh)', path)
                 if not match:
                     return self._json(400, {'error': 'bad name or id'})
+                if self.headers.get('Transfer-Encoding') or self.headers.get('Content-Length') is None:
+                    return self._json(411, {'error': 'Content-Length is required'})
                 body = self.rfile.read(int(self.headers['Content-Length']))
                 runner.inputs.setdefault(match['job'], {})[match['name']] = body
                 return self._send(204)
@@ -85,15 +87,23 @@ class FakeRunner:
                     runner._stop.setdefault(job, threading.Event()).set()
                     return self._send(202)
                 stop = runner._stop[job] = threading.Event()
-                spec = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                length = int(self.headers.get('Content-Length') or 0)
+                if length > 64 * 1024:
+                    return self._json(413, {'error': 'run body too large'})
+                spec = json.loads(self.rfile.read(length))
+                deadline = spec.get('deadline_seconds')
+                if isinstance(deadline, bool) or not isinstance(deadline, int) or not 0 < deadline <= 86400:
+                    return self._json(400, {'error': 'deadline_seconds must be an integer from 1 to 86400'})
                 runner.runs.append(spec)
                 run = runner.control['run']
                 if run.get('http_status'):
                     return self._json(run['http_status'], {'error': 'busy'})
                 stop.wait(run.get('sleep', 0))
                 if stop.is_set():
+                    # Runner-made failures come back as result-schema JSON.
                     return self._json(200, {'stage': spec['stage'], 'status': 'failed', 'schema_version': 1,
-                                            'error': 'cancelled', 'engine': runner.control['inspect']['engine']})
+                                            'error': 'cancelled', 'engine': runner.control['inspect']['engine'],
+                                            'diagnostics': {'runner': {'returncode': -15, 'log_tail': ''}}})
                 status = run.get('status', 'ok')
                 result = {'stage': spec['stage'], 'status': status, 'schema_version': 1, 'output': None,
                           'gate': None, 'effective_inputs': {}, 'measured': {},

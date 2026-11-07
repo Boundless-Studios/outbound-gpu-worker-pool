@@ -96,6 +96,8 @@ RESULT_STATUSES = frozenset(EXIT_STATUSES.values())
 RUNNER_JOB_ID = re.compile(r'[A-Za-z0-9_-]{1,64}')
 # How long a runner request other than `run` and `inspect` may take.
 RUNNER_REQUEST_SECONDS = 120.0
+# The runner accepts deadlines from 1 s to a day.
+MAX_RUNNER_DEADLINE_SECONDS = 86_400
 # Optional result sections dropped, in this order, when diagnostics would
 # exceed the pool's payload bound.
 OPTIONAL_DIAGNOSTICS = ('measured', 'gate', 'engine_effective_inputs', 'timings_s', 'weights')
@@ -644,6 +646,8 @@ class AISmithEnginePlugin:
             for name, path in inputs.items():
                 if left() <= 0:
                     raise EngineTimedOut('the stage deadline passed while uploading inputs')
+                # Bytes, not a stream, so the request carries the Content-Length
+                # the runner requires (it answers 411 to a chunked body).
                 response = await self._runner('PUT', f'/jobs/{job}/inputs/{name}',
                                               content=path.read_bytes(), timeout=left())
                 if response.status_code != 204:
@@ -658,7 +662,8 @@ class AISmithEnginePlugin:
             path = await self._fetch_output(job, output, workdir / f'{stage.stage}.glb', left())
             return result, self._checked_output(path, output)
         finally:
-            # Always: the runner deletes the job's work directory (and cancels it if running).
+            # Always: only DELETE removes the job's work directory on the runner
+            # (fetching the output does not), and it cancels a running job.
             with suppress(EngineFailed):
                 await self._runner('DELETE', f'/jobs/{job}')
 
@@ -672,7 +677,7 @@ class AISmithEnginePlugin:
         run = asyncio.ensure_future(self._runner('POST', f'/jobs/{job}/run', timeout=timeout + 30, json={
             'schema_version': ENGINE_SPEC_SCHEMA_VERSION, 'stage': stage.stage,
             'inputs': sorted(inputs), 'settings': settings,
-            'deadline_seconds': max(1, int(timeout)),
+            'deadline_seconds': max(1, min(MAX_RUNNER_DEADLINE_SECONDS, int(timeout))),
         }))
         waiters = {asyncio.ensure_future(context.cancel.wait()), asyncio.ensure_future(cancel.wait())}
         try:

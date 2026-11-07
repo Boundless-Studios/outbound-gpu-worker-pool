@@ -608,9 +608,17 @@ Over `http`, each job runs `GET /inspect` and the same drift check as `local`, t
    against `X-Sha256` and `Content-Length`.
 5. `DELETE /jobs/<job>`, always.
 
-A lease cancellation or a deadline sends `POST /jobs/<job>/cancel` first. Enrolment runs
-`GET /inspect?full=1`. The plugin never sends runner requests through the worker's egress
-proxy.
+A lease cancellation or a deadline sends `POST /jobs/<job>/cancel` first. Only `DELETE`
+removes the job's work directory on the runner; fetching the output does not. Inputs are
+sent with `Content-Length`, because the runner answers 411 to a chunked body. The runner
+enforces the deadline too (1 s to a day), and its own failures (deadline exceeded,
+cancelled, crash) arrive as `status: failed` results with `diagnostics.runner`. Enrolment
+runs `GET /inspect?full=1`. The plugin never sends runner requests through the worker's
+egress proxy.
+
+`tests/test_engine_runner_real.py` drives the real runner (AISmith-3D
+`backend/engine/serve.py`) with the suite's fake engine CLI. It is opt-in: set
+`AISMITH_ENGINE_SERVE_ROOT` to an AISmith-3D checkout.
 
 A coordinator publishes the same templates' schemas with
 `OGWP_CAPABILITY_PLUGINS=comfy-workflow`. It reads the packaged template directory for the

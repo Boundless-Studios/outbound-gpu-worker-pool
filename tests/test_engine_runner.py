@@ -211,3 +211,21 @@ def test_a_non_private_runner_url_is_refused(url):
 def test_loopback_and_private_runner_urls_are_accepted(url):
     assert runner_url({'OGWP_ENGINE_URL': url}) == url.rstrip('/')
     assert runner_url({}) is None
+
+
+async def test_a_runner_made_failure_carries_its_error(plugin, runner, tmp_path):
+    """Deadline, cancel and crash failures arrive as result JSON with diagnostics.runner."""
+    runner.control['run'] = {'status': 'failed', 'error': 'deadline exceeded',
+                             'result': {'diagnostics': {'runner': {'returncode': -9, 'log_tail': 'killed'}}}}
+    with pytest.raises(EngineFailed, match='deadline exceeded'):
+        await plugin.execute(context(tmp_path), plugin.validate(lease()))
+    assert job_calls(runner)[-1] == f'DELETE /jobs/{JOB}'
+
+
+async def test_the_runner_deadline_stays_in_its_range(plugin, runner, tmp_path, monkeypatch):
+    from outbound_gpu_worker_pool import engine
+
+    stage = plugin.recipe.stage_for('mesh.trellis2.image_to_mesh.v1')
+    monkeypatch.setattr(engine, 'MAX_RUNNER_DEADLINE_SECONDS', 2)
+    await plugin.execute(context(tmp_path), plugin.validate(lease()))
+    assert stage.deadline_seconds > 2 and runner.runs[0]['deadline_seconds'] == 2
