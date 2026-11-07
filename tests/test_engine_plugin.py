@@ -517,7 +517,7 @@ async def test_the_pre_job_inspection_is_bounded_by_the_deadline(plugin, engine,
 
 def test_the_real_pins_and_weights_register():
     versions = engine_versions(MESH3D, inspect_report())
-    assert versions['aismith_engine_commit'] == 'f7466926135bd1cdb9801432ce9d5371ad441596'
+    assert versions['aismith_engine_commit'] == '4162e2e9d49b0fb7c97caeca174ecb468e6b1260'
     assert versions['aismith_sources_lock'] == MESH3D_RECIPE.sources_lock_sha256
     assert versions['aismith_weights_lock'] == MESH3D_RECIPE.weights_lock_sha256
     assert versions['blender'] == 'Blender 4.2.23 LTS'

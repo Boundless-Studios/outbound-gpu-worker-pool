@@ -508,7 +508,7 @@ launch-flag check. Adding a profile does not change any existing recipe version.
 `mesh.trellis2.image_to_mesh.v1` and `mesh.blender.clean.v1`. Its recipe lives in
 `engine_recipes.py`:
 
-- the engine release `engine-v0.1.0` (commit `f7466926`), with the sources-lock and
+- the engine release `engine-v0.2.0` (commit `4162e2e9`), with the sources-lock and
   weights-lock digests at that commit;
 - CUDA architecture 8.9 and Blender 4.2.x LTS;
 - a 24,000 MB minimum;

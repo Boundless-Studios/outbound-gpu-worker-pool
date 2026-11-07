@@ -17,7 +17,8 @@ class FakeRunner:
     `control['run']` steers a run: `status`, `error`, `sleep` (seconds, cut short by
     cancel or DELETE), `effective_inputs`, `output` (fields merged into the result's
     output), `result` (merged into the result), `http_status`, `body` (served bytes)
-    and `x_sha256` (served header).
+    and `x_sha256` (served header). `put_sleep` delays each input upload's answer,
+    and `trickle` (seconds) serves the output 16 bytes at a time with that pause.
     """
 
     def __init__(self, inspect_report: dict):
@@ -27,6 +28,7 @@ class FakeRunner:
         self.runs: list[dict] = []
         self._stop: dict[str, threading.Event] = {}
         self._lock = threading.Lock()
+        self._closing = threading.Event()
         runner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -62,8 +64,24 @@ class FakeRunner:
                 if match:
                     run = runner.control['run']
                     body = run.get('body', GLB)
-                    return self._send(200, body, 'model/gltf-binary', {
-                        'X-Sha256': run.get('x_sha256', hashlib.sha256(GLB).hexdigest())})
+                    headers = {'X-Sha256': run.get('x_sha256', hashlib.sha256(GLB).hexdigest())}
+                    if not run.get('trickle'):
+                        return self._send(200, body, 'model/gltf-binary', headers)
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'model/gltf-binary')
+                    self.send_header('Content-Length', str(len(body)))
+                    for key, value in headers.items():
+                        self.send_header(key, value)
+                    self.end_headers()
+                    try:
+                        for start in range(0, len(body), 16):
+                            self.wfile.write(body[start:start + 16])
+                            self.wfile.flush()
+                            if runner._closing.wait(run['trickle']):
+                                return
+                    except (BrokenPipeError, ConnectionResetError):
+                        return
+                    return
                 return self._json(404, {'error': 'not found'})
 
             def do_PUT(self):
@@ -74,6 +92,7 @@ class FakeRunner:
                 if self.headers.get('Transfer-Encoding') or self.headers.get('Content-Length') is None:
                     return self._json(411, {'error': 'Content-Length is required'})
                 body = self.rfile.read(int(self.headers['Content-Length']))
+                runner._closing.wait(runner.control['run'].get('put_sleep', 0))
                 runner.inputs.setdefault(match['job'], {})[match['name']] = body
                 return self._send(204)
 
@@ -144,6 +163,7 @@ class FakeRunner:
                 if job is None or f'/jobs/{job}/' in path + '/']
 
     def close(self) -> None:
+        self._closing.set()
         for stop in self._stop.values():
             stop.set()
         self.server.shutdown()

@@ -178,7 +178,8 @@ async def test_an_expired_context_calls_nothing(plugin, runner, tmp_path):
 async def test_the_inspection_is_bounded_by_the_deadline(plugin, runner, tmp_path):
     runner.control['inspect_sleep'] = 30
     started = time.monotonic()
-    with pytest.raises(EngineTimedOut, match='while the engine was inspected'):
+    # The inspect's own bound and the job's deadline race; either way it is the deadline.
+    with pytest.raises(EngineTimedOut, match='while the engine was inspected|during the engine job'):
         await plugin.execute(context(tmp_path, deadline_seconds=2), plugin.validate(lease()))
     assert time.monotonic() - started < 15
     runner.control['inspect_sleep'] = 0
@@ -229,3 +230,71 @@ async def test_the_runner_deadline_stays_in_its_range(plugin, runner, tmp_path, 
     monkeypatch.setattr(engine, 'MAX_RUNNER_DEADLINE_SECONDS', 2)
     await plugin.execute(context(tmp_path), plugin.validate(lease()))
     assert stage.deadline_seconds > 2 and runner.runs[0]['deadline_seconds'] == 2
+
+
+
+# Transfers: one absolute deadline, and cancellation observed throughout.
+
+async def _until(condition, within: float = 30.0) -> None:
+    """Poll to a deadline, so a loaded machine slows the test rather than failing it."""
+    deadline = time.monotonic() + within
+    while not condition():
+        if time.monotonic() > deadline:
+            raise AssertionError('condition not reached')
+        await asyncio.sleep(0.02)
+
+
+async def test_a_trickling_output_cannot_outlast_the_deadline(plugin, runner, tmp_path):
+    # 128 bytes, 16 at a time, 2 s apart: about 16 s, every chunk well inside any
+    # per-operation timeout.
+    runner.control['run'] = {'trickle': 2}
+    started = time.monotonic()
+    with pytest.raises(EngineTimedOut, match='deadline'):
+        await plugin.execute(context(tmp_path, deadline_seconds=4), plugin.validate(lease()))
+    assert time.monotonic() - started < 12
+    assert f'GET /jobs/{JOB}/output' in job_calls(runner)
+    assert job_calls(runner)[-1] == f'DELETE /jobs/{JOB}'
+
+
+@pytest.mark.parametrize('how', ['plugin', 'lease'])
+async def test_cancelling_during_upload_stops_before_run(plugin, runner, tmp_path, how):
+    runner.control['run'] = {'put_sleep': 20}
+    cancel = asyncio.Event()
+    task = asyncio.create_task(plugin.execute(context(tmp_path, cancel=cancel), plugin.validate(lease())))
+    await _until(lambda: f'PUT /jobs/{JOB}/inputs/front' in job_calls(runner))
+    started = time.monotonic()
+    if how == 'plugin':
+        assert await plugin.cancel(JOB) is True
+    else:
+        cancel.set()
+    with pytest.raises(EngineCancelled):
+        await task
+    assert time.monotonic() - started < 10
+    await _until(lambda: f'DELETE /jobs/{JOB}' in job_calls(runner))
+    assert f'POST /jobs/{JOB}/run' not in job_calls(runner)
+    assert job_calls(runner)[-1] == f'DELETE /jobs/{JOB}'
+
+
+@pytest.mark.parametrize('how', ['plugin', 'lease'])
+async def test_cancelling_during_download_returns_no_output(plugin, runner, tmp_path, how):
+    runner.control['run'] = {'trickle': 1}
+    cancel = asyncio.Event()
+    task = asyncio.create_task(plugin.execute(context(tmp_path, cancel=cancel), plugin.validate(lease())))
+    await _until(lambda: f'GET /jobs/{JOB}/output' in job_calls(runner))
+    started = time.monotonic()
+    if how == 'plugin':
+        assert await plugin.cancel(JOB) is True
+    else:
+        cancel.set()
+    with pytest.raises(EngineCancelled):
+        await task
+    assert time.monotonic() - started < 6
+    assert job_calls(runner)[-1] == f'DELETE /jobs/{JOB}'
+
+
+async def test_a_job_cancelled_before_it_starts_calls_no_stage(plugin, runner, tmp_path):
+    cancel = asyncio.Event()
+    cancel.set()
+    with pytest.raises(EngineCancelled):
+        await plugin.execute(context(tmp_path, cancel=cancel), plugin.validate(lease()))
+    assert f'POST /jobs/{JOB}/run' not in job_calls(runner)
