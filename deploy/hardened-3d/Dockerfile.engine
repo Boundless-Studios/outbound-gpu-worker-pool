@@ -1,0 +1,58 @@
+# The 3D engine sidecar: `aismith-engine serve` with its runtimes baked in.
+#
+# Build context (prepared and reviewed offline; see README "What a deploy needs"):
+#   engine/            AISmith-3D source export at tag engine-v0.2.0 (`git archive`),
+#                      including vendor/sources.lock.json and vendor/weights.lock.json
+#   engine-venv/       the engine's frozen Linux virtualenv (Python 3.12)
+#   trellis2-refiner/  ComfyUI/ (0.33.0 tree with custom_nodes/ComfyUI-Trellis2),
+#                      .venv-cu128/ (torch 2.8 cu128, CuMesh/o-voxel built for sm_89,
+#                      Python 3.12) and native-contract.json; NO models/ directory
+#   blender/           Blender 4.2.23 LTS linux-x64, extracted from the official
+#                      tarball after checking its published sha256
+# Models, credentials, Git directories, caches and any home directory must not be
+# in the context. Nothing is downloaded at runtime: the container has no route out.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+# The full engine commit at the tag; `inspect` reports it (there is no .git).
+ARG ENGINE_COMMIT
+RUN test "$(printf %s "$ENGINE_COMMIT" | grep -cxE '[0-9a-f]{40}')" = 1
+# Python 3.12 for both virtualenvs, a compiler and headers for Triton's JIT,
+# and the X/GL client libraries headless Blender links against.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.12 python3.12-dev gcc g++ libc6-dev ca-certificates \
+    libgl1 libegl1 libglib2.0-0 libgomp1 libsm6 libice6 libx11-6 libxext6 \
+    libxi6 libxfixes3 libxrender1 libxxf86vm1 libxkbcommon0 \
+    && rm -rf /var/lib/apt/lists/*
+COPY engine /opt/aismith
+COPY engine-venv /opt/aismith/.venv
+COPY trellis2-refiner /opt/trellis2-refiner
+COPY blender /opt/blender
+# Interpreters are real copies inside each venv: the engine resolves symlinks
+# when it picks the refiner interpreter, and a resolved /usr/bin/python3.12 would
+# lose the venv. Then the mount points, and ComfyUI's input/output/temp
+# directories redirected to scratch. The build fails on stray Git metadata,
+# host paths baked into .pth files, a model directory, or the wrong runtimes.
+RUN set -eu; \
+    for venv in /opt/aismith/.venv /opt/trellis2-refiner/.venv-cu128; do \
+      rm -f "$venv/bin/python" "$venv/bin/python3" "$venv/bin/python3.12"; \
+      cp /usr/bin/python3.12 "$venv/bin/python3.12"; \
+      ln -s python3.12 "$venv/bin/python"; ln -s python3.12 "$venv/bin/python3"; \
+      sed -i 's|^home = .*|home = /usr/bin|' "$venv/pyvenv.cfg"; \
+    done; \
+    test ! -e /opt/trellis2-refiner/models; \
+    mkdir -p /opt/trellis2-refiner/models /opt/rembg/models; \
+    for d in input output temp; do \
+      rm -rf "/opt/trellis2-refiner/$d"; ln -s "/scratch/refiner/$d" "/opt/trellis2-refiner/$d"; \
+    done; \
+    test -z "$(find /opt -name .git -print -quit)"; \
+    if grep -rIlE '/(home|mnt|root)/' --include='*.pth' /opt/aismith/.venv /opt/trellis2-refiner/.venv-cu128; then exit 1; fi; \
+    grep -qx 'version = "0.2.0"' /opt/aismith/pyproject.toml; \
+    grep -q "__version__ = ['\"]0.33.0['\"]" /opt/trellis2-refiner/ComfyUI/comfyui_version.py; \
+    /opt/blender/blender --factory-startup --version | head -n1 | grep -qE '^Blender 4\.2\.'; \
+    /opt/trellis2-refiner/.venv-cu128/bin/python -B -c "import torch; assert torch.__version__.startswith('2.8') and torch.version.cuda.startswith('12.8')"; \
+    cd /opt/aismith && /opt/aismith/.venv/bin/python -B -c "import backend.engine.serve"
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    AISMITH_ENGINE_COMMIT=${ENGINE_COMMIT} \
+    AISMITH_OFFLINE=1
+WORKDIR /opt/aismith
+USER 65532:65532
